@@ -1,0 +1,23 @@
+{
+	"name": "wikipedia-importer",
+	"version": "1.0.0",
+	"description": "Import Wikipedia pages into Obsidian as clean Markdown with wikilinks.",
+	"main": "main.js",
+	"scripts": {
+		"dev": "node esbuild.config.mjs",
+		"build": "node esbuild.config.mjs production"
+	},
+	"keywords": [],
+	"author": "Brandon",
+	"license": "MIT",
+	"devDependencies": {
+		"@types/node": "^20.0.0",
+		"builtin-modules": "^3.3.0",
+		"esbuild": "^0.20.0",
+		"obsidian": "^1.4.11",
+		"typescript": "^5.4.0"
+	},
+	"dependencies": {
+		"jsdom": "^29.1.1"
+	}
+}

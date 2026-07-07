@@ -1,0 +1,10 @@
+{
+	"id": "wikipedia-importer",
+	"name": "Wikipedia Importer",
+	"version": "1.0.0",
+	"minAppVersion": "1.4.0",
+	"description": "Wikipedia Importer fetches a Wikipedia article and drops it into a new or existing note in your vault as tidy Markdown: every Wikipedia link becomes an internal [[wikilink]], equations become Obsidian-rendered LaTeX (WIP), images and animated gifs come through, and most of the clutter is stripped away. What you're left with is a readable, navigable note that plugs straight into your knowledge graph and Vault.",
+	"author": "Concomitant",
+	"authorUrl": "",
+	"isDesktopOnly": true
+}

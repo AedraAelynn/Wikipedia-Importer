@@ -2,7 +2,7 @@
 
 **Turn any Wikipedia page into a clean, fully-linked Obsidian note — in one command.**
 
-Wikipedia Importer fetches a Wikipedia article and drops it into a new or existing `Note` in your `Vault` as tidy Markdown: every Wikipedia link becomes an internal `[[wikilink]]`, equations become Obsidian-rendered LaTeX (WIP), images and animated gifs come through, and most of the clutter is stripped away. What you're left with is a readable, navigable note that plugs straight into your knowledge graph and `Vault`.
+Wikipedia Importer fetches a Wikipedia article and drops it into a new or existing `Note` in your `Vault` as tidy Markdown: every Wikipedia link becomes an internal `[[wikilink]]`, equations become Obsidian-rendered $\LaTeX$ (WIP), images and animated gifs come through, and most of the clutter is stripped away. What you're left with is a readable, navigable note that plugs straight into your knowledge graph and `Vault`.
 
 ---
 
@@ -64,8 +64,8 @@ Open the command palette (`Ctrl/Cmd + P`) and search "Wikipedia Importer":
 
 ## Installation
 
-### Manual (quickest)
-1. Download `main.js` and `manifest.json` from this repository.
+### Manual
+1. Download `main.js`, `package.json`, and `manifest.json` from this repository.
 2. In your vault, create the folder: `.obsidian/plugins/wikipedia-importer/`
 3. Put both files inside it.
 4. In Obsidian: **Settings → Community plugins**, enable community plugins if needed, then toggle on **Wikipedia Importer**, and adjust settings accordingly.

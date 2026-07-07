@@ -1,7 +1,7 @@
 {
 	"id": "wikipedia-importer",
 	"name": "Wikipedia Importer",
-	"version": "1.0.0",
+	"version": "1.0.2",
 	"minAppVersion": "1.4.0",
 	"description": "Import any Wikipedia article into a new or existing Note in your Vault, with clean Markdown and [[wikilinks]] for efficient Note generation workflows.",
 	"author": "Concomitant",

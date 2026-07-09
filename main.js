@@ -36,8 +36,6 @@ var DEFAULT_SETTINGS = {
   referencesStyle: "callout",
   linkMode: "wikilinks",
   imageMode: "embed",
-  highFidelityImages: true,
-  forceOriginalImages: false,
   tagLocation: "frontmatter",
   fixedTags: "",
   // blank by default; placeholder suggests "wikipedia"
@@ -104,19 +102,14 @@ var WikiImporterPlugin = class extends import_obsidian.Plugin {
       return;
     }
     const rawLeadImage = this.settings.imageMode === "off" ? null : extractLeadImage(html);
-    const leadImage = rawLeadImage && this.settings.highFidelityImages ? resolveImageUrl(
-      rawLeadImage,
-      this.settings.forceOriginalImages
-    ) : rawLeadImage;
+    const leadImage = rawLeadImage ? resolveImageUrl(rawLeadImage) : null;
     const refs = extractReferences(html);
     const body = htmlToObsidianMarkdown(html, {
       leadImage,
       linkMode: this.settings.linkMode,
       imageMode: this.settings.imageMode,
       lang: this.settings.wikiLang,
-      footnotes: refs.idToFootnote,
-      highFidelity: this.settings.highFidelityImages,
-      forceOriginal: this.settings.forceOriginalImages
+      footnotes: refs.idToFootnote
     });
     const refsSection = formatReferences(
       refs,
@@ -358,21 +351,17 @@ async function searchForTitle(query, lang) {
 var skipImageUrl = null;
 var activeLinkMode = "wikilinks";
 var activeImageMode = "embed";
-var activeHighFidelity = true;
-var activeForceOriginal = false;
 var activeLang = "en";
 var footnoteMap = /* @__PURE__ */ new Map();
 function htmlToObsidianMarkdown(html, opts = {}) {
-  var _a, _b, _c, _d, _e, _f, _g, _h;
+  var _a, _b, _c, _d, _e, _f;
   skipImageUrl = (_a = opts.leadImage) != null ? _a : null;
   activeLinkMode = (_b = opts.linkMode) != null ? _b : "wikilinks";
   activeImageMode = (_c = opts.imageMode) != null ? _c : "embed";
-  activeHighFidelity = (_d = opts.highFidelity) != null ? _d : true;
-  activeForceOriginal = (_e = opts.forceOriginal) != null ? _e : false;
-  activeLang = (_f = opts.lang) != null ? _f : "en";
-  footnoteMap = (_g = opts.footnotes) != null ? _g : /* @__PURE__ */ new Map();
+  activeLang = (_d = opts.lang) != null ? _d : "en";
+  footnoteMap = (_e = opts.footnotes) != null ? _e : /* @__PURE__ */ new Map();
   const doc = new DOMParser().parseFromString(html, "text/html");
-  const root = (_h = doc.querySelector(".mw-parser-output")) != null ? _h : doc.body;
+  const root = (_f = doc.querySelector(".mw-parser-output")) != null ? _f : doc.body;
   stripFluff(root);
   const lines = [];
   for (const node of Array.from(root.childNodes)) {
@@ -688,31 +677,6 @@ function renderTable(table, out) {
 function cellInline(cell) {
   return inline(cell).replace(/\|/g, "\\|").replace(/\n+/g, " ").trim();
 }
-function resolveImageUrl(src, forceOriginal) {
-  var _a, _b;
-  const parts = src.split("/");
-  const ti = parts.indexOf("thumb");
-  if (ti === -1 || parts.length < ti + 5)
-    return src;
-  const originalName = parts[ti + 3];
-  const original = parts.slice(0, ti).join("/") + "/" + parts.slice(ti + 1, ti + 4).join("/");
-  const ext = (_b = (_a = originalName.split(".").pop()) == null ? void 0 : _a.toLowerCase()) != null ? _b : "";
-  if (ext === "svg" || ext === "gif")
-    return original;
-  if (forceOriginal)
-    return original;
-  const rendered = parts[ti + 4];
-  const m = rendered.match(/^(\d+)px-(.*)$/);
-  if (!m)
-    return src;
-  const currentWidth = parseInt(m[1], 10);
-  const target = Math.max(currentWidth, HIGH_FIDELITY_RASTER_WIDTH);
-  if (target === currentWidth)
-    return src;
-  parts[ti + 4] = `${target}px-${m[2]}`;
-  return parts.join("/");
-}
-var HIGH_FIDELITY_RASTER_WIDTH = 1200;
 function imageEmbed(img) {
   let src = img.getAttribute("src") || "";
   if (!src)
@@ -735,7 +699,7 @@ function imageEmbed(img) {
   const alt = (img.getAttribute("alt") || "image").replace(/[[\]]/g, "");
   if (activeImageMode === "off")
     return null;
-  const finalSrc = activeHighFidelity ? resolveImageUrl(src, activeForceOriginal) : src;
+  const finalSrc = resolveImageUrl(src);
   if (activeImageMode === "link")
     return `[${alt}](${finalSrc})`;
   return w > 0 ? `![${alt}|${w}](${finalSrc})` : `![${alt}](${finalSrc})`;
@@ -805,14 +769,30 @@ function isChromeImage(src, img) {
   ];
   return chromePatterns.some((p) => file.includes(p));
 }
+function canonicalFilename(url) {
+  const parts = url.split("?")[0].split("/");
+  const ti = parts.indexOf("thumb");
+  if (ti !== -1 && parts.length > ti + 3) {
+    return parts[ti + 3].toLowerCase();
+  }
+  return (parts.pop() || url).toLowerCase();
+}
 function sameImageFile(a, b) {
-  const base = (u) => {
-    const seg = u.split("?")[0].split("/").pop() || u;
-    return seg.replace(/^\d+px-/, "").toLowerCase();
-  };
   if (a === b)
     return true;
-  return base(a) === base(b);
+  return canonicalFilename(a) === canonicalFilename(b);
+}
+function resolveImageUrl(src) {
+  var _a, _b;
+  const parts = src.split("/");
+  const ti = parts.indexOf("thumb");
+  if (ti === -1 || parts.length < ti + 5)
+    return src;
+  const originalName = parts[ti + 3];
+  const ext = (_b = (_a = originalName.split(".").pop()) == null ? void 0 : _a.toLowerCase()) != null ? _b : "";
+  if (ext !== "svg" && ext !== "gif")
+    return src;
+  return parts.slice(0, ti).join("/") + "/" + parts.slice(ti + 1, ti + 4).join("/");
 }
 function inline(el) {
   let result = "";
@@ -1319,27 +1299,6 @@ var WikiImporterSettingTab = class extends import_obsidian.PluginSettingTab {
         await this.plugin.saveSettings();
       })
     );
-    if (this.plugin.settings.imageMode !== "off") {
-      new import_obsidian.Setting(containerEl).setName("High-fidelity images").setDesc(
-        "Wikipedia serves pre-rendered thumbnails. When on, images point at the original file instead \u2014 SVG diagrams stay as scalable vectors, and animated gifs actually animate. Images are still displayed at their original size."
-      ).addToggle(
-        (tg) => tg.setValue(this.plugin.settings.highFidelityImages).onChange(async (v) => {
-          this.plugin.settings.highFidelityImages = v;
-          await this.plugin.saveSettings();
-          this.display();
-        })
-      );
-      if (this.plugin.settings.highFidelityImages) {
-        new import_obsidian.Setting(containerEl).setName("Always use original photos").setDesc(
-          "By default, large photographs load as a high-resolution render rather than the full original, which can be tens of megabytes with no visible benefit. Turn on to always fetch the original file. (Vectors and gifs already always use the original.)"
-        ).addToggle(
-          (tg) => tg.setValue(this.plugin.settings.forceOriginalImages).onChange(async (v) => {
-            this.plugin.settings.forceOriginalImages = v;
-            await this.plugin.saveSettings();
-          })
-        );
-      }
-    }
     new import_obsidian.Setting(containerEl).setName("Tags").setHeading();
     new import_obsidian.Setting(containerEl).setName("Tag location").setDesc(
       "Frontmatter keeps tags as clean metadata at the top (recommended). Inline places #tags in the note body. Both does each."

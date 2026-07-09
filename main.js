@@ -664,7 +664,7 @@ function renderTable(table, out) {
       const isHeader = cell.tagName.toLowerCase() === "th";
       const links = Array.from(cell.querySelectorAll("a")).map((a) => renderAnchor(a).trim()).filter((s) => s && s.startsWith("[["));
       if (isHeader) {
-        const label = inline(cell).trim();
+        const label = flattenLines(cell).trim();
         if (/^(v|t|e|v ?· ?t ?· ?e)$/i.test(label))
           continue;
         if (label)
@@ -712,14 +712,14 @@ function renderInfobox(table, out) {
     const data = row.querySelector("td.infobox-data, td");
     if (label && data && cells.length >= 2) {
       const labelText = inline(label).trim();
-      const valueText = infoboxValue(data);
+      const valueText = flattenLines(data);
       if (labelText && valueText) {
         facts.push(`**${labelText}:** ${valueText}`);
       }
       continue;
     }
     if (cells.length === 1) {
-      const text = infoboxValue(cells[0]);
+      const text = flattenLines(cells[0]);
       if (text)
         facts.push(text);
     }
@@ -730,7 +730,7 @@ function renderInfobox(table, out) {
     ["> [!info]- Quick facts", ...facts.map((f) => `> ${f}`)].join("\n")
   );
 }
-function infoboxValue(cell) {
+function flattenLines(cell) {
   return inline(cell).split("\n").map((s) => s.trim()).filter(Boolean).join("; ");
 }
 function cellInline(cell) {

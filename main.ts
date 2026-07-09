@@ -891,7 +891,11 @@ function renderTable(table: Element, out: string[]) {
 				.map((a) => renderAnchor(a).trim())
 				.filter((s) => s && s.startsWith("[["));
 			if (isHeader) {
-				const label = inline(cell).trim();
+				// flattenLines, not inline: a header can pack several <br>-
+				// separated lines (e.g. a native-name box's transliteration /
+				// translation / script name), which would otherwise leave raw
+				// newlines inside "**...**" and break the bold across lines.
+				const label = flattenLines(cell).trim();
 				// Skip the v·t·e navigation controls.
 				if (/^(v|t|e|v ?· ?t ?· ?e)$/i.test(label)) continue;
 				if (label) blocks.push(`**${label}**`);
@@ -956,7 +960,7 @@ function renderInfobox(table: Element, out: string[]) {
 		const data = row.querySelector("td.infobox-data, td");
 		if (label && data && cells.length >= 2) {
 			const labelText = inline(label).trim();
-			const valueText = infoboxValue(data);
+			const valueText = flattenLines(data);
 			if (labelText && valueText) {
 				facts.push(`**${labelText}:** ${valueText}`);
 			}
@@ -966,7 +970,7 @@ function renderInfobox(table: Element, out: string[]) {
 		// A lone full-width text cell (subtitle, native-language name, a
 		// classification rank, …) — usually meaningful; keep it as-is.
 		if (cells.length === 1) {
-			const text = infoboxValue(cells[0]);
+			const text = flattenLines(cells[0]);
 			if (text) facts.push(text);
 		}
 	}
@@ -980,7 +984,13 @@ function renderInfobox(table: Element, out: string[]) {
 /** Inline an infobox value cell, collapsing <br>/<li> line breaks (e.g. a
  * multi-line address, or a list of languages) into one "; "-joined line so
  * the fact still fits on a single callout line. */
-function infoboxValue(cell: Element): string {
+/** Inline a cell's content and collapse any embedded line breaks (from
+ * <br> or a <li> list) into a single "; "-joined line. Wikipedia's box
+ * templates (infobox fields, a multi-line native-name header, …) often
+ * pack several lines into one cell; left as raw newlines, that content
+ * breaks out of the single-line context (a callout row, a "**label**"
+ * wrapped in bold) it's being rendered into. */
+function flattenLines(cell: Element): string {
 	return inline(cell)
 		.split("\n")
 		.map((s) => s.trim())

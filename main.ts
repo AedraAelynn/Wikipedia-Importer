@@ -143,8 +143,22 @@ export default class WikiImporterPlugin extends Plugin {
 			return;
 		}
 
-		const leadImage =
+		const rawLeadImage =
 			this.settings.imageMode === "off" ? null : extractLeadImage(html);
+		// Same vector/animation-to-original upgrade the body images get, so
+		// the lead image isn't left blurrier than the rest of the note.
+		const leadImage = rawLeadImage
+			? resolveImageUrl(rawLeadImage.src)
+			: null;
+		// Wikipedia's own display width, so a vector/original lead image is
+		// sized to match the article instead of showing at its unconstrained
+		// intrinsic size (e.g. a full-page-wide SVG diagram).
+		const leadImageWidth = rawLeadImage?.width ?? 0;
+		const leadImageMd = leadImage
+			? leadImageWidth > 0
+				? `![${resolvedTitle}|${leadImageWidth}](${leadImage})`
+				: `![${resolvedTitle}](${leadImage})`
+			: null;
 		// Extract references FIRST so the footnote map exists before we convert
 		// the body (the in-text [^1] markers need it).
 		const refs = extractReferences(html);
@@ -198,7 +212,7 @@ export default class WikiImporterPlugin extends Plugin {
 						? `# [${resolvedTitle}](${sourceUrl})`
 						: `# ${resolvedTitle}`
 				);
-				if (leadImage) parts.push(`![${resolvedTitle}](${leadImage})`);
+				if (leadImageMd) parts.push(leadImageMd);
 				// If the title already links to the page, point the attribution at
 				// Wikipedia's homepage; otherwise carry the page link here.
 				parts.push(
@@ -211,7 +225,7 @@ export default class WikiImporterPlugin extends Plugin {
 				out = parts.join("\n\n");
 			} else {
 				const pieces: string[] = [];
-				if (leadImage) pieces.push(`![${resolvedTitle}](${leadImage})`);
+				if (leadImageMd) pieces.push(leadImageMd);
 				// No title heading, so the attribution line carries the page link.
 				pieces.push(`*Imported from [Wikipedia](${sourceUrl})*`);
 				if (inlineTags) pieces.push(inlineTags);
@@ -537,11 +551,19 @@ function htmlToObsidianMarkdown(html: string, opts: ConvertOpts = {}): string {
 	return md + "\n";
 }
 
+interface LeadImage {
+	src: string;
+	/** The width Wikipedia itself displayed this image at, so the note can
+	 * be sized to match instead of showing a vector/original file at its
+	 * unconstrained intrinsic size (see resolveImageUrl). 0 if unknown. */
+	width: number;
+}
+
 /**
  * Find the page's lead image URL BEFORE fluff-stripping removes the infobox.
- * Returns an absolute https URL, or null if none found.
+ * Returns the image plus Wikipedia's own display width, or null if none found.
  */
-function extractLeadImage(html: string): string | null {
+function extractLeadImage(html: string): LeadImage | null {
 	const doc = new DOMParser().parseFromString(html, "text/html");
 	const root = doc.querySelector(".mw-parser-output") ?? doc.body;
 
@@ -578,9 +600,9 @@ function extractLeadImage(html: string): string | null {
 			const w = parseInt(img.getAttribute("width") || "0", 10);
 			if (w && w < 50) continue;
 			if (/\/\d+px-/.test(src) || /upload\.wikimedia\.org/.test(src)) {
-				return src;
+				return { src, width: w };
 			}
-			if (/^https?:\/\//.test(src)) return src;
+			if (/^https?:\/\//.test(src)) return { src, width: w };
 		}
 	}
 	return null;
@@ -595,7 +617,8 @@ function stripFluff(root: Element) {
 		".mw-references-wrap",
 		".reflist",
 		"ol.references",
-		"table.infobox",
+		// NOTE: table.infobox intentionally NOT stripped — renderBlock() routes
+		// it to renderInfobox() instead of deleting it outright.
 		".navbox", // bottom navigation boxes (any element, not just <table>)
 		".navbox-styles",
 		".navbox-inner",
@@ -650,6 +673,12 @@ function stripFluff(root: Element) {
 		"ul.gallery",
 		"li.gallerybox",
 		".mw-empty-elt",
+		// {{Hiero}}/<hiero> (the WikiHiero extension) renders a term in actual
+		// hieroglyphic glyph images — content we have no way to display in
+		// Markdown. Left in, all that survives conversion is junk: a stray
+		// "in [[hieroglyphs]]" tacked onto a label and a redundant bullet
+		// pointing at the same link, with no real information preserved.
+		'[class*="hiero" i]',
 		// Math fallback PNGs — we extract LaTeX from <math> instead, so these
 		// raster fallbacks would otherwise double-render each equation.
 		"img.mwe-math-fallback-image-inline",
@@ -762,8 +791,14 @@ function renderBlock(node: Node, out: string[]) {
 		}
 		case "table": {
 			// Navboxes are already removed in stripFluff, so tables reaching
-			// here are content. Render them (data → pipe table, layout → lists).
-			renderTable(el, out);
+			// here are content. Infoboxes get their own renderer — their rows
+			// are label/value facts, not a grid, and forcing them into pipes
+			// or the layout-table fallback produces mush (see renderInfobox).
+			if (el.classList.contains("infobox")) {
+				renderInfobox(el, out);
+			} else {
+				renderTable(el, out);
+			}
 			break;
 		}
 		case "img": {
@@ -862,7 +897,11 @@ function renderTable(table: Element, out: string[]) {
 				.map((a) => renderAnchor(a).trim())
 				.filter((s) => s && s.startsWith("[["));
 			if (isHeader) {
-				const label = inline(cell).trim();
+				// flattenLines, not inline: a header can pack several <br>-
+				// separated lines (e.g. a native-name box's transliteration /
+				// translation / script name), which would otherwise leave raw
+				// newlines inside "**...**" and break the bold across lines.
+				const label = flattenLines(cell).trim();
 				// Skip the v·t·e navigation controls.
 				if (/^(v|t|e|v ?· ?t ?· ?e)$/i.test(label)) continue;
 				if (label) blocks.push(`**${label}**`);
@@ -878,6 +917,91 @@ function renderTable(table: Element, out: string[]) {
 		}
 	}
 	if (blocks.length) out.push(blocks.join("\n\n"));
+}
+
+/**
+ * Render a Wikipedia infobox as a collapsed callout of label/value facts,
+ * grouped under its own section headers ("Personal details", "Spouse", …).
+ * Infobox rows aren't a grid — a title bar, a photo, section dividers, and
+ * label/data pairs all sit in the same <table> — so this walks the semantic
+ * infobox-* classes MediaWiki already applies rather than trying to stretch
+ * renderTable()'s rectangular-grid logic over them.
+ */
+function renderInfobox(table: Element, out: string[]) {
+	const rows = Array.from(
+		table.querySelectorAll(":scope > tbody > tr, :scope > tr")
+	);
+	const facts: string[] = [];
+
+	for (const row of rows) {
+		const cells = Array.from(
+			row.querySelectorAll(":scope > th, :scope > td")
+		);
+
+		// A row that's essentially just a picture (portrait, flag, map, coat
+		// of arms, …) — render through the normal image pipeline. If it's the
+		// same file already used as the note's lead image, imageEmbed's
+		// dedup silently skips it instead of showing it twice.
+		const img = row.querySelector("img");
+		const rowText = (row.textContent || "").trim();
+		if (img && rowText.length < 40) {
+			const embed = imageEmbed(img);
+			if (embed) facts.push(embed);
+			continue;
+		}
+
+		// Section header: a lone <th> spanning the row, e.g. "Personal details".
+		const header = row.querySelector("th.infobox-header");
+		if (header) {
+			const label = inline(header).trim();
+			if (label) facts.push(`**${label}**`);
+			continue;
+		}
+
+		// The title bar (repeats the note's own title) — skip.
+		if (row.querySelector("th.infobox-above")) continue;
+
+		// The common case: a label cell paired with a data cell.
+		const label = row.querySelector("th.infobox-label, th");
+		const data = row.querySelector("td.infobox-data, td");
+		if (label && data && cells.length >= 2) {
+			const labelText = inline(label).trim();
+			const valueText = flattenLines(data);
+			if (labelText && valueText) {
+				facts.push(`**${labelText}:** ${valueText}`);
+			}
+			continue;
+		}
+
+		// A lone full-width text cell (subtitle, native-language name, a
+		// classification rank, …) — usually meaningful; keep it as-is.
+		if (cells.length === 1) {
+			const text = flattenLines(cells[0]);
+			if (text) facts.push(text);
+		}
+	}
+
+	if (!facts.length) return;
+	out.push(
+		["> [!info]- Quick facts", ...facts.map((f) => `> ${f}`)].join("\n")
+	);
+}
+
+/** Inline an infobox value cell, collapsing <br>/<li> line breaks (e.g. a
+ * multi-line address, or a list of languages) into one "; "-joined line so
+ * the fact still fits on a single callout line. */
+/** Inline a cell's content and collapse any embedded line breaks (from
+ * <br> or a <li> list) into a single "; "-joined line. Wikipedia's box
+ * templates (infobox fields, a multi-line native-name header, …) often
+ * pack several lines into one cell; left as raw newlines, that content
+ * breaks out of the single-line context (a callout row, a "**label**"
+ * wrapped in bold) it's being rendered into. */
+function flattenLines(cell: Element): string {
+	return inline(cell)
+		.split("\n")
+		.map((s) => s.trim())
+		.filter(Boolean)
+		.join("; ");
 }
 
 /** Inline content for a table cell, with pipes escaped so they don't break the row. */
@@ -914,8 +1038,14 @@ function imageEmbed(img: Element): string | null {
 	// Respect the image mode: off → nothing, link → a plain markdown link
 	// (no inline display), embed → an inline image embed (default).
 	if (activeImageMode === "off") return null;
-	if (activeImageMode === "link") return `[${alt}](${src})`;
-	return `![${alt}](${src})`;
+	// Point vectors/animations at their true original file (see
+	// resolveImageUrl); ordinary photos are left at Wikipedia's own size.
+	const finalSrc = resolveImageUrl(src);
+	if (activeImageMode === "link") return `[${alt}](${finalSrc})`;
+	// `![alt|500](url)` tells Obsidian to display the image at the width
+	// Wikipedia itself used, so sizing stays consistent with the article
+	// even when the source URL now points at a full vector/original file.
+	return w > 0 ? `![${alt}|${w}](${finalSrc})` : `![${alt}](${finalSrc})`;
 }
 
 /** Detect interface chrome (icons, logos, lock/edit symbols) vs real content. */
@@ -984,16 +1114,48 @@ function isChromeImage(src: string, img: Element): boolean {
 	return chromePatterns.some((p) => file.includes(p));
 }
 
-/** True if two Wikimedia image URLs point at the same underlying file,
- * ignoring the "/NNNpx-" thumbnail size prefix. */
+/** Extract the underlying Commons filename from a Wikimedia image URL,
+ * whether it's a thumbnail ("/thumb/<h1>/<h2>/Foo.svg/220px-Foo.svg.png")
+ * or a direct original ("/<h1>/<h2>/Foo.svg") — so the same file is
+ * recognized as identical regardless of which shape its URL is in. */
+function canonicalFilename(url: string): string {
+	const parts = url.split("?")[0].split("/");
+	const ti = parts.indexOf("thumb");
+	if (ti !== -1 && parts.length > ti + 3) {
+		return parts[ti + 3].toLowerCase();
+	}
+	return (parts.pop() || url).toLowerCase();
+}
+
+/** True if two Wikimedia image URLs point at the same underlying file. */
 function sameImageFile(a: string, b: string): boolean {
-	const base = (u: string) => {
-		// Take the final path segment and strip a leading "NNNpx-".
-		const seg = u.split("?")[0].split("/").pop() || u;
-		return seg.replace(/^\d+px-/, "").toLowerCase();
-	};
 	if (a === b) return true;
-	return base(a) === base(b);
+	return canonicalFilename(a) === canonicalFilename(b);
+}
+
+/**
+ * Wikipedia serves every image — including vector diagrams — as a raster
+ * thumbnail, e.g.:
+ *   .../commons/thumb/3/3b/Pinhole-camera.svg/250px-Pinhole-camera.svg.png
+ * For vectors (.svg) and animations (.gif) that's a real quality loss: an
+ * SVG rasterized at thumbnail width looks blurry once Obsidian displays it
+ * larger, and a GIF thumbnail is often a single static frame. Dropping
+ * "/thumb/" and the trailing "NNNpx-…" segment yields the real original:
+ *   .../commons/3/3b/Pinhole-camera.svg
+ * Ordinary photos (jpg/png) are left exactly as Wikipedia rendered them —
+ * matching the size Wikipedia itself used keeps note images consistent with
+ * the source article instead of guessing at a "better" resolution.
+ */
+function resolveImageUrl(src: string): string {
+	const parts = src.split("/");
+	const ti = parts.indexOf("thumb");
+	if (ti === -1 || parts.length < ti + 5) return src; // not a thumbnail URL
+	const originalName = parts[ti + 3];
+	const ext = originalName.split(".").pop()?.toLowerCase() ?? "";
+	if (ext !== "svg" && ext !== "gif") return src;
+	return (
+		parts.slice(0, ti).join("/") + "/" + parts.slice(ti + 1, ti + 4).join("/")
+	);
 }
 
 /** Convert inline content (links, bold, italic, text) to markdown. */
@@ -1031,14 +1193,24 @@ function inline(el: Node): string {
 						// Unmapped (e.g. a note, not a citation) → emit nothing.
 						break;
 					}
-					result += `^${inline(c)}`;
+					// Plain markdown has no superscript syntax; raw HTML passes
+					// through markdown renderers (including Obsidian's) intact
+					// and actually renders as superscript, unlike a bare "^".
+					result += `<sup>${inline(c)}</sup>`;
 					break;
 				}
 				case "sub":
-					result += `~${inline(c)}`;
+					result += `<sub>${inline(c)}</sub>`;
 					break;
 				case "br":
 					result += "\n";
+					break;
+				case "li":
+					// <li> shows up inline inside infobox/table cells (e.g. a
+					// list of official languages). Treat it like <br> — a new
+					// line per item — so callers that split on "\n" (like
+					// infoboxValue) see each item as its own entry.
+					result += `\n${inline(c)}`;
 					break;
 				case "code":
 					result += "`" + inline(c) + "`";

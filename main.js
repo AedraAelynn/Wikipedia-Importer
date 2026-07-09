@@ -82,6 +82,7 @@ var WikiImporterPlugin = class extends import_obsidian.Plugin {
   }
   /* -- core flow -------------------------------------------------------- */
   async importByTitle(rawTitle) {
+    var _a;
     const title = rawTitle.trim();
     if (!title) {
       new import_obsidian.Notice("No title given.");
@@ -101,7 +102,10 @@ var WikiImporterPlugin = class extends import_obsidian.Plugin {
       new import_obsidian.Notice(`Couldn't fetch "${title}". Check the name/spelling.`);
       return;
     }
-    const leadImage = this.settings.imageMode === "off" ? null : extractLeadImage(html);
+    const rawLeadImage = this.settings.imageMode === "off" ? null : extractLeadImage(html);
+    const leadImage = rawLeadImage ? resolveImageUrl(rawLeadImage.src) : null;
+    const leadImageWidth = (_a = rawLeadImage == null ? void 0 : rawLeadImage.width) != null ? _a : 0;
+    const leadImageMd = leadImage ? leadImageWidth > 0 ? `![${resolvedTitle}|${leadImageWidth}](${leadImage})` : `![${resolvedTitle}](${leadImage})` : null;
     const refs = extractReferences(html);
     const body = htmlToObsidianMarkdown(html, {
       leadImage,
@@ -140,8 +144,8 @@ ${refsSection}` : body;
         parts.push(
           this.settings.linkTitleToSource ? `# [${resolvedTitle}](${sourceUrl})` : `# ${resolvedTitle}`
         );
-        if (leadImage)
-          parts.push(`![${resolvedTitle}](${leadImage})`);
+        if (leadImageMd)
+          parts.push(leadImageMd);
         parts.push(
           this.settings.linkTitleToSource ? `*Imported from [Wikipedia](${homeUrl})*` : `*Imported from [Wikipedia](${sourceUrl})*`
         );
@@ -151,8 +155,8 @@ ${refsSection}` : body;
         out = parts.join("\n\n");
       } else {
         const pieces = [];
-        if (leadImage)
-          pieces.push(`![${resolvedTitle}](${leadImage})`);
+        if (leadImageMd)
+          pieces.push(leadImageMd);
         pieces.push(`*Imported from [Wikipedia](${sourceUrl})*`);
         if (inlineTags)
           pieces.push(inlineTags);
@@ -402,10 +406,10 @@ function extractLeadImage(html) {
       if (w && w < 50)
         continue;
       if (/\/\d+px-/.test(src) || /upload\.wikimedia\.org/.test(src)) {
-        return src;
+        return { src, width: w };
       }
       if (/^https?:\/\//.test(src))
-        return src;
+        return { src, width: w };
     }
   }
   return null;
@@ -419,7 +423,8 @@ function stripFluff(root) {
     ".mw-references-wrap",
     ".reflist",
     "ol.references",
-    "table.infobox",
+    // NOTE: table.infobox intentionally NOT stripped — renderBlock() routes
+    // it to renderInfobox() instead of deleting it outright.
     ".navbox",
     // bottom navigation boxes (any element, not just <table>)
     ".navbox-styles",
@@ -484,6 +489,12 @@ function stripFluff(root) {
     "ul.gallery",
     "li.gallerybox",
     ".mw-empty-elt",
+    // {{Hiero}}/<hiero> (the WikiHiero extension) renders a term in actual
+    // hieroglyphic glyph images — content we have no way to display in
+    // Markdown. Left in, all that survives conversion is junk: a stray
+    // "in [[hieroglyphs]]" tacked onto a label and a redundant bullet
+    // pointing at the same link, with no real information preserved.
+    '[class*="hiero" i]',
     // Math fallback PNGs — we extract LaTeX from <math> instead, so these
     // raster fallbacks would otherwise double-render each equation.
     "img.mwe-math-fallback-image-inline",
@@ -583,7 +594,11 @@ function renderBlock(node, out) {
       break;
     }
     case "table": {
-      renderTable(el, out);
+      if (el.classList.contains("infobox")) {
+        renderInfobox(el, out);
+      } else {
+        renderTable(el, out);
+      }
       break;
     }
     case "img": {
@@ -655,7 +670,7 @@ function renderTable(table, out) {
       const isHeader = cell.tagName.toLowerCase() === "th";
       const links = Array.from(cell.querySelectorAll("a")).map((a) => renderAnchor(a).trim()).filter((s) => s && s.startsWith("[["));
       if (isHeader) {
-        const label = inline(cell).trim();
+        const label = flattenLines(cell).trim();
         if (/^(v|t|e|v ?· ?t ?· ?e)$/i.test(label))
           continue;
         if (label)
@@ -672,6 +687,57 @@ function renderTable(table, out) {
   }
   if (blocks.length)
     out.push(blocks.join("\n\n"));
+}
+function renderInfobox(table, out) {
+  const rows = Array.from(
+    table.querySelectorAll(":scope > tbody > tr, :scope > tr")
+  );
+  const facts = [];
+  for (const row of rows) {
+    const cells = Array.from(
+      row.querySelectorAll(":scope > th, :scope > td")
+    );
+    const img = row.querySelector("img");
+    const rowText = (row.textContent || "").trim();
+    if (img && rowText.length < 40) {
+      const embed = imageEmbed(img);
+      if (embed)
+        facts.push(embed);
+      continue;
+    }
+    const header = row.querySelector("th.infobox-header");
+    if (header) {
+      const label2 = inline(header).trim();
+      if (label2)
+        facts.push(`**${label2}**`);
+      continue;
+    }
+    if (row.querySelector("th.infobox-above"))
+      continue;
+    const label = row.querySelector("th.infobox-label, th");
+    const data = row.querySelector("td.infobox-data, td");
+    if (label && data && cells.length >= 2) {
+      const labelText = inline(label).trim();
+      const valueText = flattenLines(data);
+      if (labelText && valueText) {
+        facts.push(`**${labelText}:** ${valueText}`);
+      }
+      continue;
+    }
+    if (cells.length === 1) {
+      const text = flattenLines(cells[0]);
+      if (text)
+        facts.push(text);
+    }
+  }
+  if (!facts.length)
+    return;
+  out.push(
+    ["> [!info]- Quick facts", ...facts.map((f) => `> ${f}`)].join("\n")
+  );
+}
+function flattenLines(cell) {
+  return inline(cell).split("\n").map((s) => s.trim()).filter(Boolean).join("; ");
 }
 function cellInline(cell) {
   return inline(cell).replace(/\|/g, "\\|").replace(/\n+/g, " ").trim();
@@ -698,9 +764,10 @@ function imageEmbed(img) {
   const alt = (img.getAttribute("alt") || "image").replace(/[[\]]/g, "");
   if (activeImageMode === "off")
     return null;
+  const finalSrc = resolveImageUrl(src);
   if (activeImageMode === "link")
-    return `[${alt}](${src})`;
-  return `![${alt}](${src})`;
+    return `[${alt}](${finalSrc})`;
+  return w > 0 ? `![${alt}|${w}](${finalSrc})` : `![${alt}](${finalSrc})`;
 }
 function isChromeImage(src, img) {
   const cls = img.getAttribute("class") || "";
@@ -767,14 +834,30 @@ function isChromeImage(src, img) {
   ];
   return chromePatterns.some((p) => file.includes(p));
 }
+function canonicalFilename(url) {
+  const parts = url.split("?")[0].split("/");
+  const ti = parts.indexOf("thumb");
+  if (ti !== -1 && parts.length > ti + 3) {
+    return parts[ti + 3].toLowerCase();
+  }
+  return (parts.pop() || url).toLowerCase();
+}
 function sameImageFile(a, b) {
-  const base = (u) => {
-    const seg = u.split("?")[0].split("/").pop() || u;
-    return seg.replace(/^\d+px-/, "").toLowerCase();
-  };
   if (a === b)
     return true;
-  return base(a) === base(b);
+  return canonicalFilename(a) === canonicalFilename(b);
+}
+function resolveImageUrl(src) {
+  var _a, _b;
+  const parts = src.split("/");
+  const ti = parts.indexOf("thumb");
+  if (ti === -1 || parts.length < ti + 5)
+    return src;
+  const originalName = parts[ti + 3];
+  const ext = (_b = (_a = originalName.split(".").pop()) == null ? void 0 : _a.toLowerCase()) != null ? _b : "";
+  if (ext !== "svg" && ext !== "gif")
+    return src;
+  return parts.slice(0, ti).join("/") + "/" + parts.slice(ti + 1, ti + 4).join("/");
 }
 function inline(el) {
   let result = "";
@@ -807,14 +890,18 @@ function inline(el) {
               result += `[^${n}]`;
             break;
           }
-          result += `^${inline(c)}`;
+          result += `<sup>${inline(c)}</sup>`;
           break;
         }
         case "sub":
-          result += `~${inline(c)}`;
+          result += `<sub>${inline(c)}</sub>`;
           break;
         case "br":
           result += "\n";
+          break;
+        case "li":
+          result += `
+${inline(c)}`;
           break;
         case "code":
           result += "`" + inline(c) + "`";

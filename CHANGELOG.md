@@ -6,8 +6,17 @@ This project follows [Semantic Versioning](https://semver.org): `MAJOR.MINOR.PAT
 
 ---
 
+## [1.1.2]
+
+### Fixed
+- **SVG images no longer look blurry.** Wikipedia serves every image — including vector diagrams — as a pre-rendered raster thumbnail. Vectors (`.svg`) and animations (`.gif`) now resolve to their true original file instead, so diagrams stay crisp and gifs actually animate.
+- **A box header spanning several lines (e.g. a native-name box giving a term's transliteration, translation, and script) could break out of its bold label** instead of collapsing onto one line — the raw `<br>` line breaks were left inside the `**...**` span. Multi-line box headers are now flattened to a single "; "-joined line, matching how infobox fields already handle multi-value cells.
+
+### Added
+- **Infoboxes are imported again**, as a collapsed "Quick facts" callout of label/value pairs instead of being stripped entirely. Section dividers (e.g. "Personal details") are kept as bold group labels, and multi-value fields (e.g. a list of languages) are joined onto one line instead of running together.
+
 ## [1.1.1]
-- Fixed various errors.
+- Minor bug fixes.
 - Added `styles.css`
 
 ## [1.1.0]

@@ -673,6 +673,12 @@ function stripFluff(root: Element) {
 		"ul.gallery",
 		"li.gallerybox",
 		".mw-empty-elt",
+		// {{Hiero}}/<hiero> (the WikiHiero extension) renders a term in actual
+		// hieroglyphic glyph images — content we have no way to display in
+		// Markdown. Left in, all that survives conversion is junk: a stray
+		// "in [[hieroglyphs]]" tacked onto a label and a redundant bullet
+		// pointing at the same link, with no real information preserved.
+		'[class*="hiero" i]',
 		// Math fallback PNGs — we extract LaTeX from <math> instead, so these
 		// raster fallbacks would otherwise double-render each equation.
 		"img.mwe-math-fallback-image-inline",

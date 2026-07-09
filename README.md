@@ -88,6 +88,12 @@ Open the command palette (`Ctrl/Cmd + P`) and search "Wikipedia Importer":
 
 ## Installation
 
+### Automatic (Simplest)
+1. Open Obsidian settings.
+2. Click `Browse` in `Community Plugins`. *Note: You must have enabled `Community Plugins`.*
+3. Search for `Wikipedia Importer`.
+4. `Install` the plugin and configure `Settings` to your preferences.
+   
 ### Manual
 1. Download `main.js`, `manifest.json`, and `styles.css` from this repository's latest release.
 2. In your vault, create the folder: `.obsidian/plugins/wikipedia-importer/`

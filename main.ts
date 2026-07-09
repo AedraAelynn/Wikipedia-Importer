@@ -23,6 +23,10 @@ type Destination =
 	| "setFolder"
 	| "newFolder";
 type NamingMode = "automatic" | "manual";
+type LinkMode = "wikilinks" | "markdown" | "none";
+type ImageMode = "embed" | "link" | "off";
+type TagLocation = "frontmatter" | "inline" | "both";
+type TagSource = "categories" | "categoriesTitle" | "categoriesFrequent";
 
 interface WikiImporterSettings {
 	destination: Destination;
@@ -31,8 +35,18 @@ interface WikiImporterSettings {
 	namingMode: NamingMode;
 	wikiLang: string; // e.g. "en"
 	includeHeading: boolean;
+	linkTitleToSource: boolean; // whether the # Title is a link
 	overwrite: boolean;
 	referencesStyle: "callout" | "plain"; // how the References section appears
+	linkMode: LinkMode; // how internal links are rendered
+	imageMode: ImageMode; // whether/how images are imported
+	tagLocation: TagLocation; // where tags go
+	fixedTags: string; // comma-separated tags applied to every import
+	autoTagsEnabled: boolean; // whether auto-tags are derived at all
+	tagSource: TagSource; // what auto-tags are derived from
+	promptForTags: boolean; // ask for tags on each import
+	maxAutoTags: number; // cap on auto-derived tags
+	includeSourceProperty: boolean; // add `source:` to frontmatter
 }
 
 const DEFAULT_SETTINGS: WikiImporterSettings = {
@@ -42,8 +56,18 @@ const DEFAULT_SETTINGS: WikiImporterSettings = {
 	namingMode: "automatic",
 	wikiLang: "en",
 	includeHeading: true,
+	linkTitleToSource: true,
 	overwrite: false,
 	referencesStyle: "callout",
+	linkMode: "wikilinks",
+	imageMode: "embed",
+	tagLocation: "frontmatter",
+	fixedTags: "", // blank by default; placeholder suggests "wikipedia"
+	autoTagsEnabled: true,
+	tagSource: "categories",
+	promptForTags: false,
+	maxAutoTags: 8,
+	includeSourceProperty: true,
 };
 
 /* ---------------------------------------------------------------------------
@@ -107,19 +131,30 @@ export default class WikiImporterPlugin extends Plugin {
 		new Notice(`Fetching "${title}"…`);
 		let html: string;
 		let resolvedTitle: string;
+		let categories: string[] = [];
 		try {
 			const res = await fetchWikipediaHtml(title, this.settings.wikiLang);
 			html = res.html;
 			resolvedTitle = res.title;
+			categories = res.categories;
 		} catch (e) {
 			console.error(e);
 			new Notice(`Couldn't fetch "${title}". Check the name/spelling.`);
 			return;
 		}
 
-		const leadImage = extractLeadImage(html);
-		const body = htmlToObsidianMarkdown(html, leadImage);
+		const leadImage =
+			this.settings.imageMode === "off" ? null : extractLeadImage(html);
+		// Extract references FIRST so the footnote map exists before we convert
+		// the body (the in-text [^1] markers need it).
 		const refs = extractReferences(html);
+		const body = htmlToObsidianMarkdown(html, {
+			leadImage,
+			linkMode: this.settings.linkMode,
+			imageMode: this.settings.imageMode,
+			lang: this.settings.wikiLang,
+			footnotes: refs.idToFootnote,
+		});
 		const refsSection = formatReferences(
 			refs,
 			this.settings.referencesStyle
@@ -130,21 +165,79 @@ export default class WikiImporterPlugin extends Plugin {
 
 		const bodyWithRefs = refsSection ? `${body}\n\n${refsSection}` : body;
 
-		let md: string;
-		if (this.settings.includeHeading) {
-			const parts: string[] = [];
-			// Title links back to the source Wikipedia page.
-			parts.push(`# [${resolvedTitle}](${sourceUrl})`);
-			if (leadImage) parts.push(`![${resolvedTitle}](${leadImage})`);
-			parts.push(`*Imported from [Wikipedia](${sourceUrl})*`);
-			parts.push(bodyWithRefs);
-			md = parts.join("\n\n");
-		} else {
-			md = leadImage
-				? `![${resolvedTitle}](${leadImage})\n\n${bodyWithRefs}`
-				: bodyWithRefs;
+		const assemble = (promptedTags: string[]) => {
+			const tags = buildTags(
+				resolvedTitle,
+				categories,
+				body,
+				this.settings,
+				promptedTags
+			);
+			// Frontmatter is needed if tags live there, or if the source
+			// property is on (even when tags are inline-only).
+			const tagsInFrontmatter = this.settings.tagLocation !== "inline";
+			const frontmatter = buildFrontmatter(
+				tagsInFrontmatter ? tags : [],
+				sourceUrl,
+				this.settings.includeSourceProperty
+			);
+			const inlineTags =
+				this.settings.tagLocation !== "frontmatter" && tags.length
+					? tags.map((t) => `#${t}`).join(" ")
+					: "";
+
+			const homeUrl = `https://${this.settings.wikiLang}.wikipedia.org/`;
+
+			let out: string;
+			if (this.settings.includeHeading) {
+				const parts: string[] = [];
+				// The title may be plain or linked. When frontmatter carries the
+				// source URL, a linked title is redundant — hence the toggle.
+				parts.push(
+					this.settings.linkTitleToSource
+						? `# [${resolvedTitle}](${sourceUrl})`
+						: `# ${resolvedTitle}`
+				);
+				if (leadImage) parts.push(`![${resolvedTitle}](${leadImage})`);
+				// If the title already links to the page, point the attribution at
+				// Wikipedia's homepage; otherwise carry the page link here.
+				parts.push(
+					this.settings.linkTitleToSource
+						? `*Imported from [Wikipedia](${homeUrl})*`
+						: `*Imported from [Wikipedia](${sourceUrl})*`
+				);
+				if (inlineTags) parts.push(inlineTags);
+				parts.push(bodyWithRefs);
+				out = parts.join("\n\n");
+			} else {
+				const pieces: string[] = [];
+				if (leadImage) pieces.push(`![${resolvedTitle}](${leadImage})`);
+				// No title heading, so the attribution line carries the page link.
+				pieces.push(`*Imported from [Wikipedia](${sourceUrl})*`);
+				if (inlineTags) pieces.push(inlineTags);
+				pieces.push(bodyWithRefs);
+				out = pieces.join("\n\n");
+			}
+			// Frontmatter goes at the very top, before everything.
+			if (frontmatter) out = `${frontmatter}\n${out}`;
+			return out;
+		};
+
+		// If the user wants to type tags per-import, ask now.
+		if (this.settings.promptForTags) {
+			new TagPromptModal(this.app, async (entered) => {
+				const md = assemble(entered);
+				await this.finishImport(md, resolvedTitle);
+			}).open();
+			return;
 		}
 
+		const md = assemble([]);
+		await this.finishImport(md, resolvedTitle);
+	}
+
+	/** Route the assembled note, honoring manual naming if enabled. */
+	async finishImport(md: string, resolvedTitle: string) {
 		if (this.settings.namingMode === "manual") {
 			new NamePromptModal(this.app, resolvedTitle, async (chosen) => {
 				await this.routeOutput(md, chosen || resolvedTitle);
@@ -286,26 +379,93 @@ export default class WikiImporterPlugin extends Plugin {
 async function fetchWikipediaHtml(
 	title: string,
 	lang: string
-): Promise<{ html: string; title: string }> {
+): Promise<{ html: string; title: string; categories: string[] }> {
 	// action=parse with prop=text returns rendered HTML (templates resolved).
+	// Adding "categories" returns the article's human-curated categories in the
+	// same call — the cleanest source for auto-tags.
 	const endpoint =
 		`https://${lang}.wikipedia.org/w/api.php?` +
 		new URLSearchParams({
 			action: "parse",
 			page: title,
-			prop: "text",
+			prop: "text|categories",
 			format: "json",
 			formatversion: "2",
 			redirects: "1",
 		}).toString();
 
 	// requestUrl avoids CORS issues that plain fetch() hits inside Obsidian.
-	const resp = await requestUrl({ url: endpoint });
-	const data = resp.json;
+	let resp = await requestUrl({ url: endpoint });
+	let data = resp.json;
+
+	// Wikipedia auto-capitalizes the first letter and follows redirects, but is
+	// case-sensitive after that ("Systems Design" ≠ "Systems design"). If the
+	// exact title misses, search for the closest match and retry.
 	if (data.error) {
-		throw new Error(data.error.info || "Wikipedia API error");
+		const found = await searchForTitle(title, lang);
+		if (!found) {
+			throw new Error(data.error.info || "Wikipedia API error");
+		}
+		const retry =
+			`https://${lang}.wikipedia.org/w/api.php?` +
+			new URLSearchParams({
+				action: "parse",
+				page: found,
+				prop: "text|categories",
+				format: "json",
+				formatversion: "2",
+				redirects: "1",
+			}).toString();
+		resp = await requestUrl({ url: retry });
+		data = resp.json;
+		if (data.error) {
+			throw new Error(data.error.info || "Wikipedia API error");
+		}
 	}
-	return { html: data.parse.text as string, title: data.parse.title as string };
+	// Categories come back as [{ns, category, hidden?}]. Skip hidden ones
+	// (maintenance categories like "Articles with unsourced statements").
+	const cats: string[] = Array.isArray(data.parse.categories)
+		? data.parse.categories
+				.filter((c: { hidden?: boolean }) => !c.hidden)
+				.map((c: { category: string }) =>
+					String(c.category).replace(/_/g, " ")
+				)
+		: [];
+	return {
+		html: data.parse.text as string,
+		title: data.parse.title as string,
+		categories: cats,
+	};
+}
+
+/**
+ * Find the closest real page title for a possibly mis-cased query.
+ * Wikipedia's search is case-insensitive, so this rescues "systems Design".
+ */
+async function searchForTitle(
+	query: string,
+	lang: string
+): Promise<string | null> {
+	try {
+		const url =
+			`https://${lang}.wikipedia.org/w/api.php?` +
+			new URLSearchParams({
+				action: "query",
+				list: "search",
+				srsearch: query,
+				srlimit: "1",
+				format: "json",
+				formatversion: "2",
+			}).toString();
+		const resp = await requestUrl({ url });
+		const hits = resp.json?.query?.search;
+		if (Array.isArray(hits) && hits.length && hits[0]?.title) {
+			return String(hits[0].title);
+		}
+	} catch {
+		/* fall through */
+	}
+	return null;
 }
 
 /* ---------------------------------------------------------------------------
@@ -319,9 +479,29 @@ async function fetchWikipediaHtml(
 // URL of the lead image already placed in the header, so the body renderer
 // can skip it and avoid a duplicate embed. Reset on each conversion.
 let skipImageUrl: string | null = null;
+// How links and images are rendered for the current conversion (set by the
+// caller; default to the original behavior so standalone calls still work).
+let activeLinkMode: LinkMode = "wikilinks";
+let activeImageMode: ImageMode = "embed";
+let activeLang = "en";
+// Maps a Wikipedia reference <li> id (e.g. "cite_note-foo-3") to its 1-based
+// footnote number, so in-text [1] markers become Obsidian [^1] footnotes.
+let footnoteMap: Map<string, number> = new Map();
 
-function htmlToObsidianMarkdown(html: string, leadImage?: string | null): string {
-	skipImageUrl = leadImage ?? null;
+interface ConvertOpts {
+	leadImage?: string | null;
+	linkMode?: LinkMode;
+	imageMode?: ImageMode;
+	lang?: string;
+	footnotes?: Map<string, number>;
+}
+
+function htmlToObsidianMarkdown(html: string, opts: ConvertOpts = {}): string {
+	skipImageUrl = opts.leadImage ?? null;
+	activeLinkMode = opts.linkMode ?? "wikilinks";
+	activeImageMode = opts.imageMode ?? "embed";
+	activeLang = opts.lang ?? "en";
+	footnoteMap = opts.footnotes ?? new Map();
 	const doc = new DOMParser().parseFromString(html, "text/html");
 	const root = doc.querySelector(".mw-parser-output") ?? doc.body;
 
@@ -346,6 +526,14 @@ function extractLeadImage(html: string): string | null {
 	const doc = new DOMParser().parseFromString(html, "text/html");
 	const root = doc.querySelector(".mw-parser-output") ?? doc.body;
 
+	// Remove maintenance banners / navboxes first so their icons (e.g. the
+	// "needs citations" question-book) can't be picked as the lead image.
+	root
+		.querySelectorAll(
+			".ambox, .ombox, .tmbox, .dmbox, .mbox-image, .navbox, .vertical-navbox, .metadata, .sidebar, .mw-message-box, [role='note']"
+		)
+		.forEach((el) => el.remove());
+
 	// Prefer the infobox image; fall back to the first sizeable thumbnail.
 	const candidates = [
 		".infobox img",
@@ -364,9 +552,12 @@ function extractLeadImage(html: string): string | null {
 			if (!src) continue;
 			// Wikipedia often serves protocol-relative //upload.wikimedia.org/...
 			if (src.startsWith("//")) src = "https:" + src;
-			// Skip tiny icons/sprites (edit pencils, sound icons, etc.)
+			// Skip interface chrome (icons, logos, maintenance-banner symbols)
+			// — the same filter the body image renderer uses.
+			if (isChromeImage(src, img)) continue;
+			// Skip tiny icons/sprites (edit pencils, sound icons, etc.).
 			const w = parseInt(img.getAttribute("width") || "0", 10);
-			if (w && w < 40) continue;
+			if (w && w < 50) continue;
 			if (/\/\d+px-/.test(src) || /upload\.wikimedia\.org/.test(src)) {
 				return src;
 			}
@@ -379,19 +570,55 @@ function extractLeadImage(html: string): string | null {
 /** Remove reference apparatus, edit links, infoboxes, nav, images, etc. */
 function stripFluff(root: Element) {
 	const junkSelectors = [
-		"sup.reference", // [1] footnote markers
-		".reference",
+		// NOTE: sup.reference / .reference intentionally NOT stripped — they
+		// become Obsidian footnote markers [^1] that link to the reference list.
 		".mw-editsection", // [edit] links
 		".mw-references-wrap",
 		".reflist",
 		"ol.references",
 		"table.infobox",
-		"table.navbox", // bottom navigation boxes — cut
+		".navbox", // bottom navigation boxes (any element, not just <table>)
+		".navbox-styles",
+		".navbox-inner",
+		".navbar", // the "v · t · e" control bar itself
+		".vte",
 		"table.vertical-navbox", // top "Part of a series" sidebar — cut
+		".vertical-navbox",
 		".sidebar", // same family (TopicTOC etc.)
 		"table.metadata",
 		".hatnote", // "Main article:" etc.
 		".navigation-not-searchable",
+		// Maintenance / cleanup banners: "This article needs additional
+		// citations", "may contain original research", orphan/stub notices, etc.
+		// These are meta-commentary about the article, not article content.
+		".ambox", // article message box (the boxed maintenance notices)
+		"table.ambox",
+		".ombox", // other message boxes
+		".tmbox", // talk-page message boxes (rarely leak in)
+		".dmbox", // disambiguation message boxes
+		".mbox-small",
+		".mbox-image",
+		".mbox-text",
+		".ambox-multiple_issues",
+		".messagebox",
+		// Fundraising / donation appeals (CentralNotice banners) and site notices.
+		".mw-fundraising",
+		".frbanner",
+		".cn-fundraising",
+		"#siteNotice",
+		".mw-dismissable-notice",
+		// Sister-project boxes ("Look up X in Wiktionary", "Media related to X
+		// at Wikimedia Commons", Wikiquote/Wikibooks/Wikisource boxes). These
+		// point outside the vault and outside Wikipedia proper.
+		".sister-project",
+		".sistersitebox",
+		".side-box",
+		".side-box-right",
+		".side-box-text",
+		".plainlinks.sistersitebox",
+		"div.sister-wikipedia",
+		".interProject",
+		".spoken-wikipedia",
 		// NOTE: .thumb / figure / img intentionally NOT stripped — images are
 		// now rendered as remote embeds. Tiny icons are filtered at render time.
 		".gallery",
@@ -420,13 +647,13 @@ function stripFluff(root: Element) {
 	for (const sel of junkSelectors) {
 		root.querySelectorAll(sel).forEach((el) => el.remove());
 	}
-	// Drop the "References", "External links", "Notes" sections wholesale by
-	// scanning headings and removing everything until the next heading.
+	// Drop the reference-apparatus sections wholesale (we rebuild References
+	// ourselves as footnotes at the end). "Further reading" is KEPT — it's
+	// genuine content, and it naturally lands just before our References.
 	dropSectionsByHeading(root, [
 		"references",
 		"external links",
 		"notes",
-		"further reading",
 		"sources",
 		"citations",
 		"bibliography",
@@ -656,11 +883,86 @@ function imageEmbed(img: Element): string | null {
 	const h = parseInt(img.getAttribute("height") || "0", 10);
 	if (w && w < 50) return null;
 	if (h && h < 50 && w && w < 100) return null;
+	// Filter interface "chrome" images (icons/logos/locks) even when they
+	// declare larger dimensions. These are decoration, not article content.
+	// Not all SVGs are chrome — real diagrams are SVG too — so we match known
+	// chrome filename patterns rather than blanket-removing every .svg.
+	if (isChromeImage(src, img)) return null;
 	// Only trust real Wikimedia upload URLs or absolute https images.
 	const okHost = /upload\.wikimedia\.org/.test(src) || /\/\d+px-/.test(src);
 	if (!okHost && !/^https?:\/\//.test(src)) return null;
 	const alt = (img.getAttribute("alt") || "image").replace(/[\[\]]/g, "");
+	// Respect the image mode: off → nothing, link → a plain markdown link
+	// (no inline display), embed → an inline image embed (default).
+	if (activeImageMode === "off") return null;
+	if (activeImageMode === "link") return `[${alt}](${src})`;
 	return `![${alt}](${src})`;
+}
+
+/** Detect interface chrome (icons, logos, lock/edit symbols) vs real content. */
+function isChromeImage(src: string, img: Element): boolean {
+	const cls = img.getAttribute("class") || "";
+	// OOjs UI / MediaWiki interface icon classes.
+	if (/\b(mw-ui-icon|oo-ui-|mw-editsection|mw-logo)/.test(cls)) return true;
+	// Rendered math equations (Wikipedia serves these as SVG from its math
+	// renderer). We convert math to LaTeX, so these must never become images.
+	if (/\/media\/math\/render\//.test(src)) return true;
+	if (/\bmwe-math-fallback-image/.test(cls)) return true;
+	const file = decodeURIComponent(src.split("/").pop() || "").toLowerCase();
+	// Known chrome filename fragments. These are the icons that show up in
+	// maintenance banners, citation locks, sister-project logos, etc.
+	const chromePatterns = [
+		"lock-green",
+		"lock-gray",
+		"lock-red",
+		"lock-blue",
+		"wikisource-logo",
+		"commons-logo",
+		"wiktionary",
+		"wikiquote",
+		"wikidata",
+		"wikibooks",
+		"wikinews",
+		"wikiversity",
+		"edit-icon",
+		"ooui",
+		"question_book", // the classic "needs citations" icon
+		"ambox",
+		"imbox",
+		"text_document_with_page_number", // "unreferenced" icon
+		"crystal_clear",
+		"emblem-",
+		"symbol_",
+		"wiki_letter",
+		"padlock",
+		"red_pog",
+		"disambig",
+		"nuvola",
+		"gnome-",
+		"folder_",
+		"creative_commons",
+		"cc-by",
+		"cc_by",
+		"public_domain",
+		"pd-icon",
+		"license",
+		"increase2",
+		"decrease2",
+		"steady2",
+		"arbcom",
+		"office-",
+		"star_full",
+		"star_empty",
+		"star_half",
+		"yes_check",
+		"x_mark",
+		"green_check",
+		"speaker_icon",
+		"loudspeaker",
+		"us_army",
+		"flag_of", // country flag icons in infoboxes/nav
+	];
+	return chromePatterns.some((p) => file.includes(p));
 }
 
 /** True if two Wikimedia image URLs point at the same underlying file,
@@ -697,9 +999,22 @@ function inline(el: Node): string {
 				case "em":
 					result += `*${inline(c)}*`;
 					break;
-				case "sup":
+				case "sup": {
+					// A citation marker: <sup class="reference"><a href="#cite_note-X">[1]</a></sup>
+					// Convert to an Obsidian footnote [^N] that links to the
+					// reference list at the bottom. If we can't map it, drop it.
+					const cls = c.getAttribute("class") || "";
+					if (cls.includes("reference")) {
+						const a = c.querySelector("a[href^='#']");
+						const id = (a?.getAttribute("href") || "").replace(/^#/, "");
+						const n = footnoteMap.get(id);
+						if (n) result += `[^${n}]`;
+						// Unmapped (e.g. a note, not a citation) → emit nothing.
+						break;
+					}
 					result += `^${inline(c)}`;
 					break;
+				}
 				case "sub":
 					result += `~${inline(c)}`;
 					break;
@@ -753,7 +1068,13 @@ function inline(el: Node): string {
  * Capture references as PLAINTEXT before stripFluff removes them.
  * Returns an array of clean citation strings (no links, no markdown).
  */
-function extractReferences(html: string): string[] {
+interface ExtractedRefs {
+	citations: string[];
+	notes: string[];
+	idToFootnote: Map<string, number>;
+}
+
+function extractReferences(html: string): ExtractedRefs {
 	const doc = new DOMParser().parseFromString(html, "text/html");
 	const root = doc.querySelector(".mw-parser-output") ?? doc.body;
 
@@ -766,25 +1087,65 @@ function extractReferences(html: string): string[] {
 
 	// The numbered citation list(s). There can be more than one on a page.
 	const lists = root.querySelectorAll("ol.references");
-	const out: string[] = [];
+	const citations: string[] = [];
+	const notes: string[] = [];
+	const idToFootnote = new Map<string, number>();
 	lists.forEach((list) => {
 		list.querySelectorAll(":scope > li").forEach((li) => {
 			// Also drop any style/script nested in this specific item, just in case.
 			li.querySelectorAll("style, script").forEach((el) => el.remove());
+
+			// A real citation is wrapped in <cite class="citation"> and/or carries
+			// bibliographic signatures. Note this BEFORE flattening to text.
+			const hasCiteEl = !!li.querySelector("cite");
+			const liId = li.getAttribute("id") || "";
+
+			// Grab the citation's own external URL (if any) so the footnote can
+			// link out to the source.
+			const extLink = li.querySelector(
+				"a.external[href^='http'], cite a[href^='http']"
+			);
+			const extHref = extLink?.getAttribute("href") || "";
+
 			// textContent flattens everything to plaintext — no links/markup.
 			let text = (li.textContent || "").replace(/\s+/g, " ").trim();
-			// Drop the leading "↑" / back-reference arrows Wikipedia adds.
 			text = text.replace(/^[↑^]+\s*/, "");
-			// Drop leading back-link letters like "a b c" that jump to citations.
 			text = text.replace(/^(?:[a-z] )+/i, "").trim();
 			if (!text) return;
-			// Guard: skip anything that still looks like leaked CSS rather than a
-			// citation (e.g. a stray inline style that wasn't in a <style> tag).
 			if (looksLikeCss(text)) return;
-			out.push(text);
+
+			if (hasCiteEl || looksLikeCitation(text)) {
+				citations.push(
+					extHref ? `${text} [source](${extHref})` : text
+				);
+				// Map this <li>'s id to its 1-based footnote number so the
+				// in-text [1] markers can point at it.
+				if (liId) idToFootnote.set(liId, citations.length);
+			} else {
+				// Explanatory note / caption that isn't a real citation.
+				notes.push(text);
+			}
 		});
 	});
-	return out;
+	return { citations, notes, idToFootnote };
+}
+
+/** Heuristic: does this plaintext look like a bibliographic citation? */
+function looksLikeCitation(s: string): boolean {
+	// Signatures common to citations but rare in explanatory prose.
+	return (
+		/\bISBN\b/.test(s) ||
+		/\bdoi:/i.test(s) ||
+		/\bPMID\b/.test(s) ||
+		/\bBibcode\b/.test(s) ||
+		/\barXiv\b/.test(s) ||
+		/\bISSN\b/.test(s) ||
+		/\bRetrieved\b/.test(s) ||
+		/\bArchived\b/.test(s) ||
+		/\bpp?\.\s*\d/.test(s) || // "p. 342" / "pp. 55–354"
+		/\(\d{4}\)/.test(s) || // "(2010)" year in parens — very citation-like
+		/\bvol\.?\s*\d/i.test(s)
+	);
 }
 
 /** Heuristic: does this string look like CSS rather than a citation? */
@@ -795,25 +1156,41 @@ function looksLikeCss(s: string): boolean {
 	return ruleHits >= 2;
 }
 
-/** Format captured references into a Markdown section per the chosen style. */
-function formatReferences(refs: string[], style: "callout" | "plain"): string {
-	if (!refs.length) return "";
-	const items = refs.map((r) => `${escapeForList(r)}`);
-	if (style === "callout") {
-		// Foldable callout (collapsed). Each line prefixed with "> ".
-		const lines = [
-			"> [!cite]- References",
-			...items.map((r, i) => `> ${i + 1}. ${r}`),
-		];
-		return lines.join("\n");
+/** Format captured references + notes into Markdown per the chosen style. */
+function formatReferences(
+	refs: ExtractedRefs,
+	style: "callout" | "plain"
+): string {
+	const sections: string[] = [];
+
+	const citations = refs.citations.map(escapeForList);
+	const notes = refs.notes.map(escapeForList);
+
+	// Notes (non-citations) keep the callout/plain treatment.
+	if (notes.length) {
+		if (style === "callout") {
+			sections.push(
+				["> [!note]- Notes", ...notes.map((n, i) => `> ${i + 1}. ${n}`)].join(
+					"\n"
+				)
+			);
+		} else {
+			sections.push(
+				["## Notes", "", ...notes.map((n, i) => `${i + 1}. ${n}`)].join("\n")
+			);
+		}
 	}
-	// Plain heading + numbered list.
-	const lines = [
-		"## References",
-		"",
-		...items.map((r, i) => `${i + 1}. ${r}`),
-	];
-	return lines.join("\n");
+
+	// Citations are emitted as Obsidian FOOTNOTE DEFINITIONS so the in-text
+	// [^1] markers become clickable and jump here. A callout can't contain
+	// footnote definitions, so these always live under a heading.
+	if (citations.length) {
+		const lines = ["## References", ""];
+		citations.forEach((c, i) => lines.push(`[^${i + 1}]: ${c}`));
+		sections.push(lines.join("\n"));
+	}
+
+	return sections.join("\n\n");
 }
 
 /** Neutralize characters that would break out of a list item. */
@@ -867,17 +1244,50 @@ function renderAnchor(a: Element): string {
 	const m = href.match(/^\/wiki\/([^#?]+)/);
 	if (m) {
 		let target = decodeURIComponent(m[1]).replace(/_/g, " ");
-		// Skip non-article namespaces (File:, Help:, Category:, etc.)
-		if (/^(File|Image|Help|Category|Template|Wikipedia|Portal|Special):/i.test(target)) {
-			return text;
+		// Skip non-article namespaces (File:, Help:, Category:, the various
+		// Talk namespaces, Template/Template talk, etc.). These are not article
+		// content — they're the v·t·e navigation controls and meta links.
+		if (
+			/^(File|Image|Media|Help|Category|Template|Wikipedia|Portal|Special|Draft|Module|Book|TimedText|Gadget|MediaWiki|User):/i.test(
+				target
+			) ||
+			/(^|\s)talk:/i.test(target)
+		) {
+			// Return nothing for these — including the stray "v"/"t"/"e" text —
+			// so navigation controls don't leak as letters or links.
+			return "";
 		}
+		// "none" → plain text, no link at all.
+		if (activeLinkMode === "none") {
+			return text || target;
+		}
+		// "markdown" → a standard web link to the Wikipedia page (creates no
+		// vault note; good for a reading copy).
+		if (activeLinkMode === "markdown") {
+			const url =
+				`https://${activeLang}.wikipedia.org/wiki/` +
+				encodeURIComponent(target.replace(/ /g, "_"));
+			return `[${text || target}](${url})`;
+		}
+		// "wikilinks" (default) → Obsidian [[wikilinks]].
 		if (!text) return `[[${target}]]`;
 		if (text.toLowerCase() === target.toLowerCase()) return `[[${target}]]`;
 		return `[[${target}|${text}]]`;
 	}
 
-	// External link: keep as normal markdown link if it has http(s).
+	// External link: keep as normal markdown link if it has http(s),
+	// unless the user asked for no links at all.
 	if (/^https?:\/\//.test(href)) {
+		// Sister projects (Wiktionary, Commons, Wikiquote, …) — drop the link
+		// but keep the surrounding text readable.
+		if (
+			/\b(wiktionary|wikiquote|wikibooks|wikisource|wikinews|wikiversity|wikivoyage|wikispecies|commons\.wikimedia|wikidata)\.org/i.test(
+				href
+			)
+		) {
+			return text;
+		}
+		if (activeLinkMode === "none") return text || href;
 		return text ? `[${text}](${href})` : href;
 	}
 
@@ -891,6 +1301,97 @@ function renderAnchor(a: Element): string {
 
 function sanitizeFilename(name: string): string {
 	return name.replace(/[\\/:*?"<>|]/g, "-").trim();
+}
+
+/** Turn arbitrary text into a valid Obsidian tag (no spaces/punctuation). */
+function sanitizeTag(s: string): string {
+	return s
+		.trim()
+		.toLowerCase()
+		.replace(/&/g, "and")
+		.replace(/[^a-z0-9]+/g, "-") // non-alphanumerics → hyphen
+		.replace(/^-+|-+$/g, "") // trim leading/trailing hyphens
+		.replace(/-{2,}/g, "-"); // collapse repeats
+}
+
+/** Build the final tag list: user tags first, then auto-derived ones. */
+function buildTags(
+	title: string,
+	categories: string[],
+	body: string,
+	settings: WikiImporterSettings,
+	promptedTags: string[] = []
+): string[] {
+	const tags: string[] = [];
+	const push = (raw: string) => {
+		const t = sanitizeTag(raw);
+		if (t && !tags.includes(t)) tags.push(t);
+	};
+
+	// 1) USER TAGS FIRST — tags typed at import time, then the standing list.
+	for (const t of promptedTags) push(t);
+	for (const t of settings.fixedTags.split(",")) push(t);
+
+	const userCount = tags.length;
+
+	// 2) AUTO TAGS (optional) — appended after the user's own.
+	if (settings.autoTagsEnabled) {
+		for (const c of categories) push(c);
+		if (settings.tagSource === "categoriesTitle") {
+			push(title);
+		}
+		if (settings.tagSource === "categoriesFrequent") {
+			for (const w of frequentWords(body, 5)) push(w);
+		}
+		// Cap only the auto-derived portion; user tags are never truncated.
+		const cap = Math.max(1, settings.maxAutoTags);
+		return tags.slice(0, userCount + cap);
+	}
+
+	return tags;
+}
+
+/** Very small stop-word list for frequency analysis. */
+const STOP_WORDS = new Set(
+	"the a an and or but of to in on at for with from by as is are was were be been being this that these those it its into than then also such not no can may used use using one two first second new other some more most many which who whom whose what when where how why about over under between within without".split(
+		" "
+	)
+);
+
+/** Return the N most frequent meaningful words in the text. */
+function frequentWords(text: string, n: number): string[] {
+	const counts = new Map<string, number>();
+	const words = text
+		.toLowerCase()
+		.replace(/\[\[[^\]]*\]\]/g, " ") // drop wikilink syntax
+		.replace(/[^a-z\s]/g, " ")
+		.split(/\s+/);
+	for (const w of words) {
+		if (w.length < 4 || STOP_WORDS.has(w)) continue;
+		counts.set(w, (counts.get(w) || 0) + 1);
+	}
+	return [...counts.entries()]
+		.sort((a, b) => b[1] - a[1])
+		.slice(0, n)
+		.map(([w]) => w);
+}
+
+/** Build a YAML frontmatter block with tags and (optionally) the source URL. */
+function buildFrontmatter(
+	tags: string[],
+	sourceUrl: string,
+	includeSource: boolean
+): string {
+	// Nothing to write? Skip the block entirely rather than emitting `---\n---`.
+	if (!tags.length && !includeSource) return "";
+	const lines = ["---"];
+	if (tags.length) {
+		lines.push("tags:");
+		for (const t of tags) lines.push(`  - ${t}`);
+	}
+	if (includeSource) lines.push(`source: ${sourceUrl}`);
+	lines.push("---");
+	return lines.join("\n");
 }
 
 /* ---------------------------------------------------------------------------
@@ -993,6 +1494,58 @@ class NamePromptModal extends Modal {
 	submit() {
 		this.close();
 		this.onSubmit(this.value);
+	}
+
+	onClose() {
+		this.contentEl.empty();
+	}
+}
+
+/** Prompt for tags to add to this import (comma-separated). */
+class TagPromptModal extends Modal {
+	private onSubmit: (tags: string[]) => void;
+	private value = "";
+
+	constructor(app: App, onSubmit: (tags: string[]) => void) {
+		super(app);
+		this.onSubmit = onSubmit;
+	}
+
+	onOpen() {
+		const { contentEl } = this;
+		contentEl.createEl("h3", { text: "Add tags" });
+		contentEl.createEl("p", {
+			text: "Comma-separated. These are added before any automatic tags. Leave blank to skip.",
+			cls: "setting-item-description",
+		});
+		const input = contentEl.createEl("input", {
+			type: "text",
+			placeholder: "physics, reference, to-read",
+		});
+		input.style.width = "100%";
+		input.style.marginBottom = "0.75em";
+		input.addEventListener("input", (e) => {
+			this.value = (e.target as HTMLInputElement).value;
+		});
+		input.addEventListener("keydown", (e) => {
+			if (e.key === "Enter") {
+				e.preventDefault();
+				this.submit();
+			}
+		});
+		const btn = contentEl.createEl("button", { text: "Import" });
+		btn.addEventListener("click", () => this.submit());
+		input.focus();
+	}
+
+	submit() {
+		this.close();
+		this.onSubmit(
+			this.value
+				.split(",")
+				.map((s) => s.trim())
+				.filter(Boolean)
+		);
 	}
 
 	onClose() {
@@ -1128,6 +1681,41 @@ class WikiImporterSettingTab extends PluginSettingTab {
 					.onChange(async (v) => {
 						this.plugin.settings.includeHeading = v;
 						await this.plugin.saveSettings();
+						this.display();
+					})
+			);
+
+		if (this.plugin.settings.includeHeading) {
+			new Setting(containerEl)
+				.setName("Link the title to Wikipedia")
+				.setDesc(
+					"When on, the # Title links to the source page. Turn off to " +
+						"avoid a redundant link — the frontmatter already records " +
+						"the source URL."
+				)
+				.addToggle((tg) =>
+					tg
+						.setValue(this.plugin.settings.linkTitleToSource)
+						.onChange(async (v) => {
+							this.plugin.settings.linkTitleToSource = v;
+							await this.plugin.saveSettings();
+						})
+				);
+		}
+
+		new Setting(containerEl)
+			.setName("Add source property")
+			.setDesc(
+				"Record the Wikipedia page URL as a `source:` property in the " +
+					"note's frontmatter. This is the durable record of where the " +
+					"note came from."
+			)
+			.addToggle((tg) =>
+				tg
+					.setValue(this.plugin.settings.includeSourceProperty)
+					.onChange(async (v) => {
+						this.plugin.settings.includeSourceProperty = v;
+						await this.plugin.saveSettings();
 					})
 			);
 
@@ -1149,5 +1737,153 @@ class WikiImporterSettingTab extends PluginSettingTab {
 						await this.plugin.saveSettings();
 					})
 			);
+
+		containerEl.createEl("h3", { text: "Links & images" });
+
+		new Setting(containerEl)
+			.setName("Link style")
+			.setDesc(
+				"How internal Wikipedia links are written. Wikilinks build your " +
+					"vault graph; Markdown links point to Wikipedia online " +
+					"(no notes created); None strips linking entirely."
+			)
+			.addDropdown((d) =>
+				d
+					.addOption("wikilinks", "Wikilinks [[Page]]")
+					.addOption("markdown", "Markdown links (to Wikipedia)")
+					.addOption("none", "No links (plain text)")
+					.setValue(this.plugin.settings.linkMode)
+					.onChange(async (v) => {
+						this.plugin.settings.linkMode = v as LinkMode;
+						await this.plugin.saveSettings();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName("Images")
+			.setDesc(
+				"Whether images and gifs are imported, and how. Embed shows them " +
+					"inline; Link inserts a text link without displaying; Off " +
+					"skips images entirely."
+			)
+			.addDropdown((d) =>
+				d
+					.addOption("embed", "Embed (inline)")
+					.addOption("link", "Link only")
+					.addOption("off", "Off")
+					.setValue(this.plugin.settings.imageMode)
+					.onChange(async (v) => {
+						this.plugin.settings.imageMode = v as ImageMode;
+						await this.plugin.saveSettings();
+					})
+			);
+
+		containerEl.createEl("h3", { text: "Tags" });
+
+		new Setting(containerEl)
+			.setName("Tag location")
+			.setDesc(
+				"Frontmatter keeps tags as clean metadata at the top (recommended). " +
+					"Inline places #tags in the note body. Both does each."
+			)
+			.addDropdown((d) =>
+				d
+					.addOption("frontmatter", "Frontmatter (YAML)")
+					.addOption("inline", "Inline #tags")
+					.addOption("both", "Both")
+					.setValue(this.plugin.settings.tagLocation)
+					.onChange(async (v) => {
+						this.plugin.settings.tagLocation = v as TagLocation;
+						await this.plugin.saveSettings();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName("Fixed tags")
+			.setDesc(
+				"Comma-separated tags applied to every import. These appear " +
+					"before any automatic tags and are never truncated."
+			)
+			.addText((t) =>
+				t
+					.setPlaceholder("wikipedia, reference")
+					.setValue(this.plugin.settings.fixedTags)
+					.onChange(async (v) => {
+						this.plugin.settings.fixedTags = v;
+						await this.plugin.saveSettings();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName("Ask for tags on each import")
+			.setDesc(
+				"Prompt for tags when importing. Entered tags come first, before " +
+					"your standing tags and any automatic ones."
+			)
+			.addToggle((tg) =>
+				tg
+					.setValue(this.plugin.settings.promptForTags)
+					.onChange(async (v) => {
+						this.plugin.settings.promptForTags = v;
+						await this.plugin.saveSettings();
+					})
+			);
+
+		new Setting(containerEl)
+			.setName("Automatic tagging")
+			.setDesc(
+				"Derive tags from the article itself. Turn off to use only your " +
+					"own tags."
+			)
+			.addToggle((tg) =>
+				tg
+					.setValue(this.plugin.settings.autoTagsEnabled)
+					.onChange(async (v) => {
+						this.plugin.settings.autoTagsEnabled = v;
+						await this.plugin.saveSettings();
+						this.display();
+					})
+			);
+
+		if (this.plugin.settings.autoTagsEnabled) {
+			new Setting(containerEl)
+				.setName("Auto-tag source")
+				.setDesc(
+					"Where automatic tags come from. Wikipedia's own categories " +
+						"are the cleanest; optionally add the page title or the " +
+						"most frequent content words."
+				)
+				.addDropdown((d) =>
+					d
+						.addOption("categories", "Categories only")
+						.addOption("categoriesTitle", "Categories + title")
+						.addOption(
+							"categoriesFrequent",
+							"Categories + frequent words"
+						)
+						.setValue(this.plugin.settings.tagSource)
+						.onChange(async (v) => {
+							this.plugin.settings.tagSource = v as TagSource;
+							await this.plugin.saveSettings();
+						})
+				);
+
+			new Setting(containerEl)
+				.setName("Max auto tags")
+				.setDesc(
+					"Cap on automatically-derived tags. Your own tags are never " +
+						"truncated."
+				)
+				.addText((t) =>
+					t
+						.setValue(String(this.plugin.settings.maxAutoTags))
+						.onChange(async (v) => {
+							const n = parseInt(v, 10);
+							this.plugin.settings.maxAutoTags =
+								isNaN(n) || n < 1 ? 8 : n;
+							await this.plugin.saveSettings();
+						})
+				);
+		}
 	}
 }

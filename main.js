@@ -31,8 +31,19 @@ var DEFAULT_SETTINGS = {
   namingMode: "automatic",
   wikiLang: "en",
   includeHeading: true,
+  linkTitleToSource: true,
   overwrite: false,
-  referencesStyle: "callout"
+  referencesStyle: "callout",
+  linkMode: "wikilinks",
+  imageMode: "embed",
+  tagLocation: "frontmatter",
+  fixedTags: "",
+  // blank by default; placeholder suggests "wikipedia"
+  autoTagsEnabled: true,
+  tagSource: "categories",
+  promptForTags: false,
+  maxAutoTags: 8,
+  includeSourceProperty: true
 };
 var WikiImporterPlugin = class extends import_obsidian.Plugin {
   async onload() {
@@ -79,18 +90,26 @@ var WikiImporterPlugin = class extends import_obsidian.Plugin {
     new import_obsidian.Notice(`Fetching "${title}"\u2026`);
     let html;
     let resolvedTitle;
+    let categories = [];
     try {
       const res = await fetchWikipediaHtml(title, this.settings.wikiLang);
       html = res.html;
       resolvedTitle = res.title;
+      categories = res.categories;
     } catch (e) {
       console.error(e);
       new import_obsidian.Notice(`Couldn't fetch "${title}". Check the name/spelling.`);
       return;
     }
-    const leadImage = extractLeadImage(html);
-    const body = htmlToObsidianMarkdown(html, leadImage);
+    const leadImage = this.settings.imageMode === "off" ? null : extractLeadImage(html);
     const refs = extractReferences(html);
+    const body = htmlToObsidianMarkdown(html, {
+      leadImage,
+      linkMode: this.settings.linkMode,
+      imageMode: this.settings.imageMode,
+      lang: this.settings.wikiLang,
+      footnotes: refs.idToFootnote
+    });
     const refsSection = formatReferences(
       refs,
       this.settings.referencesStyle
@@ -99,20 +118,64 @@ var WikiImporterPlugin = class extends import_obsidian.Plugin {
     const bodyWithRefs = refsSection ? `${body}
 
 ${refsSection}` : body;
-    let md;
-    if (this.settings.includeHeading) {
-      const parts = [];
-      parts.push(`# [${resolvedTitle}](${sourceUrl})`);
-      if (leadImage)
-        parts.push(`![${resolvedTitle}](${leadImage})`);
-      parts.push(`*Imported from [Wikipedia](${sourceUrl})*`);
-      parts.push(bodyWithRefs);
-      md = parts.join("\n\n");
-    } else {
-      md = leadImage ? `![${resolvedTitle}](${leadImage})
-
-${bodyWithRefs}` : bodyWithRefs;
+    const assemble = (promptedTags) => {
+      const tags = buildTags(
+        resolvedTitle,
+        categories,
+        body,
+        this.settings,
+        promptedTags
+      );
+      const tagsInFrontmatter = this.settings.tagLocation !== "inline";
+      const frontmatter = buildFrontmatter(
+        tagsInFrontmatter ? tags : [],
+        sourceUrl,
+        this.settings.includeSourceProperty
+      );
+      const inlineTags = this.settings.tagLocation !== "frontmatter" && tags.length ? tags.map((t) => `#${t}`).join(" ") : "";
+      const homeUrl = `https://${this.settings.wikiLang}.wikipedia.org/`;
+      let out;
+      if (this.settings.includeHeading) {
+        const parts = [];
+        parts.push(
+          this.settings.linkTitleToSource ? `# [${resolvedTitle}](${sourceUrl})` : `# ${resolvedTitle}`
+        );
+        if (leadImage)
+          parts.push(`![${resolvedTitle}](${leadImage})`);
+        parts.push(
+          this.settings.linkTitleToSource ? `*Imported from [Wikipedia](${homeUrl})*` : `*Imported from [Wikipedia](${sourceUrl})*`
+        );
+        if (inlineTags)
+          parts.push(inlineTags);
+        parts.push(bodyWithRefs);
+        out = parts.join("\n\n");
+      } else {
+        const pieces = [];
+        if (leadImage)
+          pieces.push(`![${resolvedTitle}](${leadImage})`);
+        pieces.push(`*Imported from [Wikipedia](${sourceUrl})*`);
+        if (inlineTags)
+          pieces.push(inlineTags);
+        pieces.push(bodyWithRefs);
+        out = pieces.join("\n\n");
+      }
+      if (frontmatter)
+        out = `${frontmatter}
+${out}`;
+      return out;
+    };
+    if (this.settings.promptForTags) {
+      new TagPromptModal(this.app, async (entered) => {
+        const md2 = assemble(entered);
+        await this.finishImport(md2, resolvedTitle);
+      }).open();
+      return;
     }
+    const md = assemble([]);
+    await this.finishImport(md, resolvedTitle);
+  }
+  /** Route the assembled note, honoring manual naming if enabled. */
+  async finishImport(md, resolvedTitle) {
     if (this.settings.namingMode === "manual") {
       new NamePromptModal(this.app, resolvedTitle, async (chosen) => {
         await this.routeOutput(md, chosen || resolvedTitle);
@@ -223,24 +286,75 @@ async function fetchWikipediaHtml(title, lang) {
   const endpoint = `https://${lang}.wikipedia.org/w/api.php?` + new URLSearchParams({
     action: "parse",
     page: title,
-    prop: "text",
+    prop: "text|categories",
     format: "json",
     formatversion: "2",
     redirects: "1"
   }).toString();
-  const resp = await (0, import_obsidian.requestUrl)({ url: endpoint });
-  const data = resp.json;
+  let resp = await (0, import_obsidian.requestUrl)({ url: endpoint });
+  let data = resp.json;
   if (data.error) {
-    throw new Error(data.error.info || "Wikipedia API error");
+    const found = await searchForTitle(title, lang);
+    if (!found) {
+      throw new Error(data.error.info || "Wikipedia API error");
+    }
+    const retry = `https://${lang}.wikipedia.org/w/api.php?` + new URLSearchParams({
+      action: "parse",
+      page: found,
+      prop: "text|categories",
+      format: "json",
+      formatversion: "2",
+      redirects: "1"
+    }).toString();
+    resp = await (0, import_obsidian.requestUrl)({ url: retry });
+    data = resp.json;
+    if (data.error) {
+      throw new Error(data.error.info || "Wikipedia API error");
+    }
   }
-  return { html: data.parse.text, title: data.parse.title };
+  const cats = Array.isArray(data.parse.categories) ? data.parse.categories.filter((c) => !c.hidden).map(
+    (c) => String(c.category).replace(/_/g, " ")
+  ) : [];
+  return {
+    html: data.parse.text,
+    title: data.parse.title,
+    categories: cats
+  };
+}
+async function searchForTitle(query, lang) {
+  var _a, _b, _c;
+  try {
+    const url = `https://${lang}.wikipedia.org/w/api.php?` + new URLSearchParams({
+      action: "query",
+      list: "search",
+      srsearch: query,
+      srlimit: "1",
+      format: "json",
+      formatversion: "2"
+    }).toString();
+    const resp = await (0, import_obsidian.requestUrl)({ url });
+    const hits = (_b = (_a = resp.json) == null ? void 0 : _a.query) == null ? void 0 : _b.search;
+    if (Array.isArray(hits) && hits.length && ((_c = hits[0]) == null ? void 0 : _c.title)) {
+      return String(hits[0].title);
+    }
+  } catch (e) {
+  }
+  return null;
 }
 var skipImageUrl = null;
-function htmlToObsidianMarkdown(html, leadImage) {
-  var _a;
-  skipImageUrl = leadImage != null ? leadImage : null;
+var activeLinkMode = "wikilinks";
+var activeImageMode = "embed";
+var activeLang = "en";
+var footnoteMap = /* @__PURE__ */ new Map();
+function htmlToObsidianMarkdown(html, opts = {}) {
+  var _a, _b, _c, _d, _e, _f;
+  skipImageUrl = (_a = opts.leadImage) != null ? _a : null;
+  activeLinkMode = (_b = opts.linkMode) != null ? _b : "wikilinks";
+  activeImageMode = (_c = opts.imageMode) != null ? _c : "embed";
+  activeLang = (_d = opts.lang) != null ? _d : "en";
+  footnoteMap = (_e = opts.footnotes) != null ? _e : /* @__PURE__ */ new Map();
   const doc = new DOMParser().parseFromString(html, "text/html");
-  const root = (_a = doc.querySelector(".mw-parser-output")) != null ? _a : doc.body;
+  const root = (_f = doc.querySelector(".mw-parser-output")) != null ? _f : doc.body;
   stripFluff(root);
   const lines = [];
   for (const node of Array.from(root.childNodes)) {
@@ -255,6 +369,9 @@ function extractLeadImage(html) {
   var _a;
   const doc = new DOMParser().parseFromString(html, "text/html");
   const root = (_a = doc.querySelector(".mw-parser-output")) != null ? _a : doc.body;
+  root.querySelectorAll(
+    ".ambox, .ombox, .tmbox, .dmbox, .mbox-image, .navbox, .vertical-navbox, .metadata, .sidebar, .mw-message-box, [role='note']"
+  ).forEach((el) => el.remove());
   const candidates = [
     ".infobox img",
     "table.infobox img",
@@ -273,8 +390,10 @@ function extractLeadImage(html) {
         continue;
       if (src.startsWith("//"))
         src = "https:" + src;
+      if (isChromeImage(src, img))
+        continue;
       const w = parseInt(img.getAttribute("width") || "0", 10);
-      if (w && w < 40)
+      if (w && w < 50)
         continue;
       if (/\/\d+px-/.test(src) || /upload\.wikimedia\.org/.test(src)) {
         return src;
@@ -287,25 +406,65 @@ function extractLeadImage(html) {
 }
 function stripFluff(root) {
   const junkSelectors = [
-    "sup.reference",
-    // [1] footnote markers
-    ".reference",
+    // NOTE: sup.reference / .reference intentionally NOT stripped — they
+    // become Obsidian footnote markers [^1] that link to the reference list.
     ".mw-editsection",
     // [edit] links
     ".mw-references-wrap",
     ".reflist",
     "ol.references",
     "table.infobox",
-    "table.navbox",
-    // bottom navigation boxes — cut
+    ".navbox",
+    // bottom navigation boxes (any element, not just <table>)
+    ".navbox-styles",
+    ".navbox-inner",
+    ".navbar",
+    // the "v · t · e" control bar itself
+    ".vte",
     "table.vertical-navbox",
     // top "Part of a series" sidebar — cut
+    ".vertical-navbox",
     ".sidebar",
     // same family (TopicTOC etc.)
     "table.metadata",
     ".hatnote",
     // "Main article:" etc.
     ".navigation-not-searchable",
+    // Maintenance / cleanup banners: "This article needs additional
+    // citations", "may contain original research", orphan/stub notices, etc.
+    // These are meta-commentary about the article, not article content.
+    ".ambox",
+    // article message box (the boxed maintenance notices)
+    "table.ambox",
+    ".ombox",
+    // other message boxes
+    ".tmbox",
+    // talk-page message boxes (rarely leak in)
+    ".dmbox",
+    // disambiguation message boxes
+    ".mbox-small",
+    ".mbox-image",
+    ".mbox-text",
+    ".ambox-multiple_issues",
+    ".messagebox",
+    // Fundraising / donation appeals (CentralNotice banners) and site notices.
+    ".mw-fundraising",
+    ".frbanner",
+    ".cn-fundraising",
+    "#siteNotice",
+    ".mw-dismissable-notice",
+    // Sister-project boxes ("Look up X in Wiktionary", "Media related to X
+    // at Wikimedia Commons", Wikiquote/Wikibooks/Wikisource boxes). These
+    // point outside the vault and outside Wikipedia proper.
+    ".sister-project",
+    ".sistersitebox",
+    ".side-box",
+    ".side-box-right",
+    ".side-box-text",
+    ".plainlinks.sistersitebox",
+    "div.sister-wikipedia",
+    ".interProject",
+    ".spoken-wikipedia",
     // NOTE: .thumb / figure / img intentionally NOT stripped — images are
     // now rendered as remote embeds. Tiny icons are filtered at render time.
     ".gallery",
@@ -339,7 +498,6 @@ function stripFluff(root) {
     "references",
     "external links",
     "notes",
-    "further reading",
     "sources",
     "citations",
     "bibliography"
@@ -526,11 +684,82 @@ function imageEmbed(img) {
     return null;
   if (h && h < 50 && w && w < 100)
     return null;
+  if (isChromeImage(src, img))
+    return null;
   const okHost = /upload\.wikimedia\.org/.test(src) || /\/\d+px-/.test(src);
   if (!okHost && !/^https?:\/\//.test(src))
     return null;
   const alt = (img.getAttribute("alt") || "image").replace(/[\[\]]/g, "");
+  if (activeImageMode === "off")
+    return null;
+  if (activeImageMode === "link")
+    return `[${alt}](${src})`;
   return `![${alt}](${src})`;
+}
+function isChromeImage(src, img) {
+  const cls = img.getAttribute("class") || "";
+  if (/\b(mw-ui-icon|oo-ui-|mw-editsection|mw-logo)/.test(cls))
+    return true;
+  if (/\/media\/math\/render\//.test(src))
+    return true;
+  if (/\bmwe-math-fallback-image/.test(cls))
+    return true;
+  const file = decodeURIComponent(src.split("/").pop() || "").toLowerCase();
+  const chromePatterns = [
+    "lock-green",
+    "lock-gray",
+    "lock-red",
+    "lock-blue",
+    "wikisource-logo",
+    "commons-logo",
+    "wiktionary",
+    "wikiquote",
+    "wikidata",
+    "wikibooks",
+    "wikinews",
+    "wikiversity",
+    "edit-icon",
+    "ooui",
+    "question_book",
+    // the classic "needs citations" icon
+    "ambox",
+    "imbox",
+    "text_document_with_page_number",
+    // "unreferenced" icon
+    "crystal_clear",
+    "emblem-",
+    "symbol_",
+    "wiki_letter",
+    "padlock",
+    "red_pog",
+    "disambig",
+    "nuvola",
+    "gnome-",
+    "folder_",
+    "creative_commons",
+    "cc-by",
+    "cc_by",
+    "public_domain",
+    "pd-icon",
+    "license",
+    "increase2",
+    "decrease2",
+    "steady2",
+    "arbcom",
+    "office-",
+    "star_full",
+    "star_empty",
+    "star_half",
+    "yes_check",
+    "x_mark",
+    "green_check",
+    "speaker_icon",
+    "loudspeaker",
+    "us_army",
+    "flag_of"
+    // country flag icons in infoboxes/nav
+  ];
+  return chromePatterns.some((p) => file.includes(p));
 }
 function sameImageFile(a, b) {
   const base = (u) => {
@@ -562,9 +791,19 @@ function inline(el) {
         case "em":
           result += `*${inline(c)}*`;
           break;
-        case "sup":
+        case "sup": {
+          const cls = c.getAttribute("class") || "";
+          if (cls.includes("reference")) {
+            const a = c.querySelector("a[href^='#']");
+            const id = ((a == null ? void 0 : a.getAttribute("href")) || "").replace(/^#/, "");
+            const n = footnoteMap.get(id);
+            if (n)
+              result += `[^${n}]`;
+            break;
+          }
           result += `^${inline(c)}`;
           break;
+        }
         case "sub":
           result += `~${inline(c)}`;
           break;
@@ -611,10 +850,18 @@ function extractReferences(html) {
   const root = (_a = doc.querySelector(".mw-parser-output")) != null ? _a : doc.body;
   root.querySelectorAll("ol.references style, ol.references script").forEach((el) => el.remove());
   const lists = root.querySelectorAll("ol.references");
-  const out = [];
+  const citations = [];
+  const notes = [];
+  const idToFootnote = /* @__PURE__ */ new Map();
   lists.forEach((list) => {
     list.querySelectorAll(":scope > li").forEach((li) => {
       li.querySelectorAll("style, script").forEach((el) => el.remove());
+      const hasCiteEl = !!li.querySelector("cite");
+      const liId = li.getAttribute("id") || "";
+      const extLink = li.querySelector(
+        "a.external[href^='http'], cite a[href^='http']"
+      );
+      const extHref = (extLink == null ? void 0 : extLink.getAttribute("href")) || "";
       let text = (li.textContent || "").replace(/\s+/g, " ").trim();
       text = text.replace(/^[↑^]+\s*/, "");
       text = text.replace(/^(?:[a-z] )+/i, "").trim();
@@ -622,10 +869,23 @@ function extractReferences(html) {
         return;
       if (looksLikeCss(text))
         return;
-      out.push(text);
+      if (hasCiteEl || looksLikeCitation(text)) {
+        citations.push(
+          extHref ? `${text} [source](${extHref})` : text
+        );
+        if (liId)
+          idToFootnote.set(liId, citations.length);
+      } else {
+        notes.push(text);
+      }
     });
   });
-  return out;
+  return { citations, notes, idToFootnote };
+}
+function looksLikeCitation(s) {
+  return /\bISBN\b/.test(s) || /\bdoi:/i.test(s) || /\bPMID\b/.test(s) || /\bBibcode\b/.test(s) || /\barXiv\b/.test(s) || /\bISSN\b/.test(s) || /\bRetrieved\b/.test(s) || /\bArchived\b/.test(s) || /\bpp?\.\s*\d/.test(s) || // "p. 342" / "pp. 55–354"
+  /\(\d{4}\)/.test(s) || // "(2010)" year in parens — very citation-like
+  /\bvol\.?\s*\d/i.test(s);
 }
 function looksLikeCss(s) {
   if (s.includes(".mw-parser-output"))
@@ -634,22 +894,28 @@ function looksLikeCss(s) {
   return ruleHits >= 2;
 }
 function formatReferences(refs, style) {
-  if (!refs.length)
-    return "";
-  const items = refs.map((r) => `${escapeForList(r)}`);
-  if (style === "callout") {
-    const lines2 = [
-      "> [!cite]- References",
-      ...items.map((r, i) => `> ${i + 1}. ${r}`)
-    ];
-    return lines2.join("\n");
+  const sections = [];
+  const citations = refs.citations.map(escapeForList);
+  const notes = refs.notes.map(escapeForList);
+  if (notes.length) {
+    if (style === "callout") {
+      sections.push(
+        ["> [!note]- Notes", ...notes.map((n, i) => `> ${i + 1}. ${n}`)].join(
+          "\n"
+        )
+      );
+    } else {
+      sections.push(
+        ["## Notes", "", ...notes.map((n, i) => `${i + 1}. ${n}`)].join("\n")
+      );
+    }
   }
-  const lines = [
-    "## References",
-    "",
-    ...items.map((r, i) => `${i + 1}. ${r}`)
-  ];
-  return lines.join("\n");
+  if (citations.length) {
+    const lines = ["## References", ""];
+    citations.forEach((c, i) => lines.push(`[^${i + 1}]: ${c}`));
+    sections.push(lines.join("\n"));
+  }
+  return sections.join("\n\n");
 }
 function escapeForList(s) {
   return s.replace(/\n+/g, " ").trim();
@@ -686,8 +952,17 @@ function renderAnchor(a) {
   const m = href.match(/^\/wiki\/([^#?]+)/);
   if (m) {
     let target = decodeURIComponent(m[1]).replace(/_/g, " ");
-    if (/^(File|Image|Help|Category|Template|Wikipedia|Portal|Special):/i.test(target)) {
-      return text;
+    if (/^(File|Image|Media|Help|Category|Template|Wikipedia|Portal|Special|Draft|Module|Book|TimedText|Gadget|MediaWiki|User):/i.test(
+      target
+    ) || /(^|\s)talk:/i.test(target)) {
+      return "";
+    }
+    if (activeLinkMode === "none") {
+      return text || target;
+    }
+    if (activeLinkMode === "markdown") {
+      const url = `https://${activeLang}.wikipedia.org/wiki/` + encodeURIComponent(target.replace(/ /g, "_"));
+      return `[${text || target}](${url})`;
     }
     if (!text)
       return `[[${target}]]`;
@@ -696,12 +971,78 @@ function renderAnchor(a) {
     return `[[${target}|${text}]]`;
   }
   if (/^https?:\/\//.test(href)) {
+    if (/\b(wiktionary|wikiquote|wikibooks|wikisource|wikinews|wikiversity|wikivoyage|wikispecies|commons\.wikimedia|wikidata)\.org/i.test(
+      href
+    )) {
+      return text;
+    }
+    if (activeLinkMode === "none")
+      return text || href;
     return text ? `[${text}](${href})` : href;
   }
   return text;
 }
 function sanitizeFilename(name) {
   return name.replace(/[\\/:*?"<>|]/g, "-").trim();
+}
+function sanitizeTag(s) {
+  return s.trim().toLowerCase().replace(/&/g, "and").replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").replace(/-{2,}/g, "-");
+}
+function buildTags(title, categories, body, settings, promptedTags = []) {
+  const tags = [];
+  const push = (raw) => {
+    const t = sanitizeTag(raw);
+    if (t && !tags.includes(t))
+      tags.push(t);
+  };
+  for (const t of promptedTags)
+    push(t);
+  for (const t of settings.fixedTags.split(","))
+    push(t);
+  const userCount = tags.length;
+  if (settings.autoTagsEnabled) {
+    for (const c of categories)
+      push(c);
+    if (settings.tagSource === "categoriesTitle") {
+      push(title);
+    }
+    if (settings.tagSource === "categoriesFrequent") {
+      for (const w of frequentWords(body, 5))
+        push(w);
+    }
+    const cap = Math.max(1, settings.maxAutoTags);
+    return tags.slice(0, userCount + cap);
+  }
+  return tags;
+}
+var STOP_WORDS = new Set(
+  "the a an and or but of to in on at for with from by as is are was were be been being this that these those it its into than then also such not no can may used use using one two first second new other some more most many which who whom whose what when where how why about over under between within without".split(
+    " "
+  )
+);
+function frequentWords(text, n) {
+  const counts = /* @__PURE__ */ new Map();
+  const words = text.toLowerCase().replace(/\[\[[^\]]*\]\]/g, " ").replace(/[^a-z\s]/g, " ").split(/\s+/);
+  for (const w of words) {
+    if (w.length < 4 || STOP_WORDS.has(w))
+      continue;
+    counts.set(w, (counts.get(w) || 0) + 1);
+  }
+  return [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, n).map(([w]) => w);
+}
+function buildFrontmatter(tags, sourceUrl, includeSource) {
+  if (!tags.length && !includeSource)
+    return "";
+  const lines = ["---"];
+  if (tags.length) {
+    lines.push("tags:");
+    for (const t of tags)
+      lines.push(`  - ${t}`);
+  }
+  if (includeSource)
+    lines.push(`source: ${sourceUrl}`);
+  lines.push("---");
+  return lines.join("\n");
 }
 var TitlePromptModal = class extends import_obsidian.Modal {
   constructor(app, onSubmit) {
@@ -788,6 +1129,48 @@ var NamePromptModal = class extends import_obsidian.Modal {
     this.contentEl.empty();
   }
 };
+var TagPromptModal = class extends import_obsidian.Modal {
+  constructor(app, onSubmit) {
+    super(app);
+    this.value = "";
+    this.onSubmit = onSubmit;
+  }
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.createEl("h3", { text: "Add tags" });
+    contentEl.createEl("p", {
+      text: "Comma-separated. These are added before any automatic tags. Leave blank to skip.",
+      cls: "setting-item-description"
+    });
+    const input = contentEl.createEl("input", {
+      type: "text",
+      placeholder: "physics, reference, to-read"
+    });
+    input.style.width = "100%";
+    input.style.marginBottom = "0.75em";
+    input.addEventListener("input", (e) => {
+      this.value = e.target.value;
+    });
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") {
+        e.preventDefault();
+        this.submit();
+      }
+    });
+    const btn = contentEl.createEl("button", { text: "Import" });
+    btn.addEventListener("click", () => this.submit());
+    input.focus();
+  }
+  submit() {
+    this.close();
+    this.onSubmit(
+      this.value.split(",").map((s) => s.trim()).filter(Boolean)
+    );
+  }
+  onClose() {
+    this.contentEl.empty();
+  }
+};
 var WikiImporterSettingTab = class extends import_obsidian.PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
@@ -849,6 +1232,25 @@ var WikiImporterSettingTab = class extends import_obsidian.PluginSettingTab {
       (tg) => tg.setValue(this.plugin.settings.includeHeading).onChange(async (v) => {
         this.plugin.settings.includeHeading = v;
         await this.plugin.saveSettings();
+        this.display();
+      })
+    );
+    if (this.plugin.settings.includeHeading) {
+      new import_obsidian.Setting(containerEl).setName("Link the title to Wikipedia").setDesc(
+        "When on, the # Title links to the source page. Turn off to avoid a redundant link \u2014 the frontmatter already records the source URL."
+      ).addToggle(
+        (tg) => tg.setValue(this.plugin.settings.linkTitleToSource).onChange(async (v) => {
+          this.plugin.settings.linkTitleToSource = v;
+          await this.plugin.saveSettings();
+        })
+      );
+    }
+    new import_obsidian.Setting(containerEl).setName("Add source property").setDesc(
+      "Record the Wikipedia page URL as a `source:` property in the note's frontmatter. This is the durable record of where the note came from."
+    ).addToggle(
+      (tg) => tg.setValue(this.plugin.settings.includeSourceProperty).onChange(async (v) => {
+        this.plugin.settings.includeSourceProperty = v;
+        await this.plugin.saveSettings();
       })
     );
     new import_obsidian.Setting(containerEl).setName("References appearance").setDesc(
@@ -859,5 +1261,78 @@ var WikiImporterSettingTab = class extends import_obsidian.PluginSettingTab {
         await this.plugin.saveSettings();
       })
     );
+    containerEl.createEl("h3", { text: "Links & images" });
+    new import_obsidian.Setting(containerEl).setName("Link style").setDesc(
+      "How internal Wikipedia links are written. Wikilinks build your vault graph; Markdown links point to Wikipedia online (no notes created); None strips linking entirely."
+    ).addDropdown(
+      (d) => d.addOption("wikilinks", "Wikilinks [[Page]]").addOption("markdown", "Markdown links (to Wikipedia)").addOption("none", "No links (plain text)").setValue(this.plugin.settings.linkMode).onChange(async (v) => {
+        this.plugin.settings.linkMode = v;
+        await this.plugin.saveSettings();
+      })
+    );
+    new import_obsidian.Setting(containerEl).setName("Images").setDesc(
+      "Whether images and gifs are imported, and how. Embed shows them inline; Link inserts a text link without displaying; Off skips images entirely."
+    ).addDropdown(
+      (d) => d.addOption("embed", "Embed (inline)").addOption("link", "Link only").addOption("off", "Off").setValue(this.plugin.settings.imageMode).onChange(async (v) => {
+        this.plugin.settings.imageMode = v;
+        await this.plugin.saveSettings();
+      })
+    );
+    containerEl.createEl("h3", { text: "Tags" });
+    new import_obsidian.Setting(containerEl).setName("Tag location").setDesc(
+      "Frontmatter keeps tags as clean metadata at the top (recommended). Inline places #tags in the note body. Both does each."
+    ).addDropdown(
+      (d) => d.addOption("frontmatter", "Frontmatter (YAML)").addOption("inline", "Inline #tags").addOption("both", "Both").setValue(this.plugin.settings.tagLocation).onChange(async (v) => {
+        this.plugin.settings.tagLocation = v;
+        await this.plugin.saveSettings();
+      })
+    );
+    new import_obsidian.Setting(containerEl).setName("Fixed tags").setDesc(
+      "Comma-separated tags applied to every import. These appear before any automatic tags and are never truncated."
+    ).addText(
+      (t) => t.setPlaceholder("wikipedia, reference").setValue(this.plugin.settings.fixedTags).onChange(async (v) => {
+        this.plugin.settings.fixedTags = v;
+        await this.plugin.saveSettings();
+      })
+    );
+    new import_obsidian.Setting(containerEl).setName("Ask for tags on each import").setDesc(
+      "Prompt for tags when importing. Entered tags come first, before your standing tags and any automatic ones."
+    ).addToggle(
+      (tg) => tg.setValue(this.plugin.settings.promptForTags).onChange(async (v) => {
+        this.plugin.settings.promptForTags = v;
+        await this.plugin.saveSettings();
+      })
+    );
+    new import_obsidian.Setting(containerEl).setName("Automatic tagging").setDesc(
+      "Derive tags from the article itself. Turn off to use only your own tags."
+    ).addToggle(
+      (tg) => tg.setValue(this.plugin.settings.autoTagsEnabled).onChange(async (v) => {
+        this.plugin.settings.autoTagsEnabled = v;
+        await this.plugin.saveSettings();
+        this.display();
+      })
+    );
+    if (this.plugin.settings.autoTagsEnabled) {
+      new import_obsidian.Setting(containerEl).setName("Auto-tag source").setDesc(
+        "Where automatic tags come from. Wikipedia's own categories are the cleanest; optionally add the page title or the most frequent content words."
+      ).addDropdown(
+        (d) => d.addOption("categories", "Categories only").addOption("categoriesTitle", "Categories + title").addOption(
+          "categoriesFrequent",
+          "Categories + frequent words"
+        ).setValue(this.plugin.settings.tagSource).onChange(async (v) => {
+          this.plugin.settings.tagSource = v;
+          await this.plugin.saveSettings();
+        })
+      );
+      new import_obsidian.Setting(containerEl).setName("Max auto tags").setDesc(
+        "Cap on automatically-derived tags. Your own tags are never truncated."
+      ).addText(
+        (t) => t.setValue(String(this.plugin.settings.maxAutoTags)).onChange(async (v) => {
+          const n = parseInt(v, 10);
+          this.plugin.settings.maxAutoTags = isNaN(n) || n < 1 ? 8 : n;
+          await this.plugin.saveSettings();
+        })
+      );
+    }
   }
 };

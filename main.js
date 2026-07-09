@@ -52,22 +52,22 @@ var WikiImporterPlugin = class extends import_obsidian.Plugin {
       id: "import-wikipedia-page",
       name: "Import Wikipedia page by title",
       callback: () => {
-        new TitlePromptModal(this.app, async (title) => {
-          await this.importByTitle(title);
+        new TitlePromptModal(this.app, (title) => {
+          void this.importByTitle(title);
         }).open();
       }
     });
     this.addCommand({
       id: "import-wikipedia-from-note-title",
       name: "Import Wikipedia page matching current note title",
-      editorCallback: async (_editor, view) => {
+      editorCallback: (_editor, view) => {
         var _a;
         const name = (_a = view.file) == null ? void 0 : _a.basename;
         if (!name) {
           new import_obsidian.Notice("No active note.");
           return;
         }
-        await this.importByTitle(name);
+        void this.importByTitle(name);
       }
     });
     this.addSettingTab(new WikiImporterSettingTab(this.app, this));
@@ -165,9 +165,9 @@ ${out}`;
       return out;
     };
     if (this.settings.promptForTags) {
-      new TagPromptModal(this.app, async (entered) => {
+      new TagPromptModal(this.app, (entered) => {
         const md2 = assemble(entered);
-        await this.finishImport(md2, resolvedTitle);
+        void this.finishImport(md2, resolvedTitle);
       }).open();
       return;
     }
@@ -177,8 +177,8 @@ ${out}`;
   /** Route the assembled note, honoring manual naming if enabled. */
   async finishImport(md, resolvedTitle) {
     if (this.settings.namingMode === "manual") {
-      new NamePromptModal(this.app, resolvedTitle, async (chosen) => {
-        await this.routeOutput(md, chosen || resolvedTitle);
+      new NamePromptModal(this.app, resolvedTitle, (chosen) => {
+        void this.routeOutput(md, chosen || resolvedTitle);
       }).open();
       return;
     }
@@ -283,6 +283,7 @@ ${out}`;
   }
 };
 async function fetchWikipediaHtml(title, lang) {
+  var _a, _b, _c;
   const endpoint = `https://${lang}.wikipedia.org/w/api.php?` + new URLSearchParams({
     action: "parse",
     page: title,
@@ -296,7 +297,7 @@ async function fetchWikipediaHtml(title, lang) {
   if (data.error) {
     const found = await searchForTitle(title, lang);
     if (!found) {
-      throw new Error(data.error.info || "Wikipedia API error");
+      throw new Error((_a = data.error.info) != null ? _a : "Wikipedia API error");
     }
     const retry = `https://${lang}.wikipedia.org/w/api.php?` + new URLSearchParams({
       action: "parse",
@@ -309,20 +310,22 @@ async function fetchWikipediaHtml(title, lang) {
     resp = await (0, import_obsidian.requestUrl)({ url: retry });
     data = resp.json;
     if (data.error) {
-      throw new Error(data.error.info || "Wikipedia API error");
+      throw new Error((_b = data.error.info) != null ? _b : "Wikipedia API error");
     }
   }
-  const cats = Array.isArray(data.parse.categories) ? data.parse.categories.filter((c) => !c.hidden).map(
-    (c) => String(c.category).replace(/_/g, " ")
-  ) : [];
+  const parsed = data.parse;
+  if (!(parsed == null ? void 0 : parsed.text) || !parsed.title) {
+    throw new Error("Wikipedia API returned no page content");
+  }
+  const cats = ((_c = parsed.categories) != null ? _c : []).filter((c) => !c.hidden).map((c) => c.category.replace(/_/g, " "));
   return {
-    html: data.parse.text,
-    title: data.parse.title,
+    html: parsed.text,
+    title: parsed.title,
     categories: cats
   };
 }
 async function searchForTitle(query, lang) {
-  var _a, _b, _c;
+  var _a;
   try {
     const url = `https://${lang}.wikipedia.org/w/api.php?` + new URLSearchParams({
       action: "query",
@@ -333,9 +336,12 @@ async function searchForTitle(query, lang) {
       formatversion: "2"
     }).toString();
     const resp = await (0, import_obsidian.requestUrl)({ url });
-    const hits = (_b = (_a = resp.json) == null ? void 0 : _a.query) == null ? void 0 : _b.search;
-    if (Array.isArray(hits) && hits.length && ((_c = hits[0]) == null ? void 0 : _c.title)) {
-      return String(hits[0].title);
+    const json = resp.json;
+    const hits = (_a = json.query) == null ? void 0 : _a.search;
+    if (hits && hits.length > 0) {
+      const first = hits[0].title;
+      if (first)
+        return first;
     }
   } catch (e) {
   }
@@ -689,7 +695,7 @@ function imageEmbed(img) {
   const okHost = /upload\.wikimedia\.org/.test(src) || /\/\d+px-/.test(src);
   if (!okHost && !/^https?:\/\//.test(src))
     return null;
-  const alt = (img.getAttribute("alt") || "image").replace(/[\[\]]/g, "");
+  const alt = (img.getAttribute("alt") || "image").replace(/[[\]]/g, "");
   if (activeImageMode === "off")
     return null;
   if (activeImageMode === "link")
@@ -824,7 +830,7 @@ $$${tex}$$
           break;
         }
         default: {
-          const innerMath = c.querySelector ? c.querySelector("math") : null;
+          const innerMath = c.querySelector("math");
           if (innerMath) {
             const tex = mathLatex(innerMath);
             if (tex) {
@@ -1052,7 +1058,7 @@ var TitlePromptModal = class extends import_obsidian.Modal {
   }
   onOpen() {
     const { contentEl } = this;
-    contentEl.createEl("h3", { text: "Import Wikipedia page" });
+    contentEl.createEl("h2", { text: "Import Wikipedia page" });
     contentEl.createEl("p", {
       text: "Enter the exact name of the Wikipedia page to import.",
       cls: "setting-item-description"
@@ -1061,8 +1067,7 @@ var TitlePromptModal = class extends import_obsidian.Modal {
       type: "text",
       placeholder: "e.g. Physics"
     });
-    input.style.width = "100%";
-    input.style.marginBottom = "0.75em";
+    input.addClass("wikipedia-importer-modal-input");
     input.addEventListener("input", (e) => {
       this.value = e.target.value;
     });
@@ -1098,14 +1103,13 @@ var NamePromptModal = class extends import_obsidian.Modal {
   }
   onOpen() {
     const { contentEl } = this;
-    contentEl.createEl("h3", { text: "Name this note" });
+    contentEl.createEl("h2", { text: "Name this note" });
     contentEl.createEl("p", {
       text: "This is the name of the imported note (it can differ from the Wikipedia page title).",
       cls: "setting-item-description"
     });
     const input = contentEl.createEl("input", { type: "text" });
-    input.style.width = "100%";
-    input.style.marginBottom = "0.75em";
+    input.addClass("wikipedia-importer-modal-input");
     input.value = this.value;
     input.addEventListener("input", (e) => {
       this.value = e.target.value;
@@ -1137,7 +1141,7 @@ var TagPromptModal = class extends import_obsidian.Modal {
   }
   onOpen() {
     const { contentEl } = this;
-    contentEl.createEl("h3", { text: "Add tags" });
+    contentEl.createEl("h2", { text: "Add tags" });
     contentEl.createEl("p", {
       text: "Comma-separated. These are added before any automatic tags. Leave blank to skip.",
       cls: "setting-item-description"
@@ -1146,8 +1150,7 @@ var TagPromptModal = class extends import_obsidian.Modal {
       type: "text",
       placeholder: "physics, reference, to-read"
     });
-    input.style.width = "100%";
-    input.style.marginBottom = "0.75em";
+    input.addClass("wikipedia-importer-modal-input");
     input.addEventListener("input", (e) => {
       this.value = e.target.value;
     });
@@ -1261,7 +1264,7 @@ var WikiImporterSettingTab = class extends import_obsidian.PluginSettingTab {
         await this.plugin.saveSettings();
       })
     );
-    containerEl.createEl("h3", { text: "Links & images" });
+    new import_obsidian.Setting(containerEl).setName("Links & images").setHeading();
     new import_obsidian.Setting(containerEl).setName("Link style").setDesc(
       "How internal Wikipedia links are written. Wikilinks build your vault graph; Markdown links point to Wikipedia online (no notes created); None strips linking entirely."
     ).addDropdown(
@@ -1278,7 +1281,7 @@ var WikiImporterSettingTab = class extends import_obsidian.PluginSettingTab {
         await this.plugin.saveSettings();
       })
     );
-    containerEl.createEl("h3", { text: "Tags" });
+    new import_obsidian.Setting(containerEl).setName("Tags").setHeading();
     new import_obsidian.Setting(containerEl).setName("Tag location").setDesc(
       "Frontmatter keeps tags as clean metadata at the top (recommended). Inline places #tags in the note body. Both does each."
     ).addDropdown(

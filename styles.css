@@ -1,0 +1,7 @@
+/* Wikipedia Importer — plugin styles */
+
+/* Text inputs inside the plugin's modals (title / name / tag prompts). */
+.wikipedia-importer-modal-input {
+	width: 100%;
+	margin-bottom: 0.75em;
+}

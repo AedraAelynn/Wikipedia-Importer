@@ -85,8 +85,8 @@ export default class WikiImporterPlugin extends Plugin {
 			id: "import-wikipedia-page",
 			name: "Import Wikipedia page by title",
 			callback: () => {
-				new TitlePromptModal(this.app, async (title) => {
-					await this.importByTitle(title);
+				new TitlePromptModal(this.app, (title) => {
+					void this.importByTitle(title);
 				}).open();
 			},
 		});
@@ -96,13 +96,13 @@ export default class WikiImporterPlugin extends Plugin {
 		this.addCommand({
 			id: "import-wikipedia-from-note-title",
 			name: "Import Wikipedia page matching current note title",
-			editorCallback: async (_editor: Editor, view: MarkdownView) => {
+			editorCallback: (_editor: Editor, view: MarkdownView) => {
 				const name = view.file?.basename;
 				if (!name) {
 					new Notice("No active note.");
 					return;
 				}
-				await this.importByTitle(name);
+				void this.importByTitle(name);
 			},
 		});
 
@@ -225,9 +225,9 @@ export default class WikiImporterPlugin extends Plugin {
 
 		// If the user wants to type tags per-import, ask now.
 		if (this.settings.promptForTags) {
-			new TagPromptModal(this.app, async (entered) => {
+			new TagPromptModal(this.app, (entered) => {
 				const md = assemble(entered);
-				await this.finishImport(md, resolvedTitle);
+				void this.finishImport(md, resolvedTitle);
 			}).open();
 			return;
 		}
@@ -239,8 +239,8 @@ export default class WikiImporterPlugin extends Plugin {
 	/** Route the assembled note, honoring manual naming if enabled. */
 	async finishImport(md: string, resolvedTitle: string) {
 		if (this.settings.namingMode === "manual") {
-			new NamePromptModal(this.app, resolvedTitle, async (chosen) => {
-				await this.routeOutput(md, chosen || resolvedTitle);
+			new NamePromptModal(this.app, resolvedTitle, (chosen) => {
+				void this.routeOutput(md, chosen || resolvedTitle);
 			}).open();
 			return;
 		}
@@ -344,13 +344,13 @@ export default class WikiImporterPlugin extends Plugin {
 						? `${dir}/${safeTitle} (imported).md`
 						: `${safeTitle} (imported).md`
 				);
-				const file = (await this.app.vault.create(altPath, md)) as TFile;
+				const file = await this.app.vault.create(altPath, md);
 				new Notice(`Created "${file.path}".`);
 				await this.app.workspace.getLeaf(true).openFile(file);
 				return;
 			}
 
-			const file = (await this.app.vault.create(path, md)) as TFile;
+			const file = await this.app.vault.create(path, md);
 			new Notice(`Created "${file.path}".`);
 			await this.app.workspace.getLeaf(true).openFile(file);
 		} catch (e) {
@@ -376,6 +376,23 @@ export default class WikiImporterPlugin extends Plugin {
  * Wikipedia fetch
  * ------------------------------------------------------------------------- */
 
+/** Shape of the Wikipedia action=parse API response we rely on. */
+interface WikiCategory {
+	category: string;
+	hidden?: boolean;
+}
+interface WikiParseResponse {
+	error?: { info?: string };
+	parse?: {
+		text?: string;
+		title?: string;
+		categories?: WikiCategory[];
+	};
+}
+interface WikiSearchResponse {
+	query?: { search?: { title?: string }[] };
+}
+
 async function fetchWikipediaHtml(
 	title: string,
 	lang: string
@@ -396,7 +413,7 @@ async function fetchWikipediaHtml(
 
 	// requestUrl avoids CORS issues that plain fetch() hits inside Obsidian.
 	let resp = await requestUrl({ url: endpoint });
-	let data = resp.json;
+	let data = resp.json as WikiParseResponse;
 
 	// Wikipedia auto-capitalizes the first letter and follows redirects, but is
 	// case-sensitive after that ("Systems Design" ≠ "Systems design"). If the
@@ -404,7 +421,7 @@ async function fetchWikipediaHtml(
 	if (data.error) {
 		const found = await searchForTitle(title, lang);
 		if (!found) {
-			throw new Error(data.error.info || "Wikipedia API error");
+			throw new Error(data.error.info ?? "Wikipedia API error");
 		}
 		const retry =
 			`https://${lang}.wikipedia.org/w/api.php?` +
@@ -417,23 +434,23 @@ async function fetchWikipediaHtml(
 				redirects: "1",
 			}).toString();
 		resp = await requestUrl({ url: retry });
-		data = resp.json;
+		data = resp.json as WikiParseResponse;
 		if (data.error) {
-			throw new Error(data.error.info || "Wikipedia API error");
+			throw new Error(data.error.info ?? "Wikipedia API error");
 		}
+	}
+	const parsed = data.parse;
+	if (!parsed?.text || !parsed.title) {
+		throw new Error("Wikipedia API returned no page content");
 	}
 	// Categories come back as [{ns, category, hidden?}]. Skip hidden ones
 	// (maintenance categories like "Articles with unsourced statements").
-	const cats: string[] = Array.isArray(data.parse.categories)
-		? data.parse.categories
-				.filter((c: { hidden?: boolean }) => !c.hidden)
-				.map((c: { category: string }) =>
-					String(c.category).replace(/_/g, " ")
-				)
-		: [];
+	const cats: string[] = (parsed.categories ?? [])
+		.filter((c) => !c.hidden)
+		.map((c) => c.category.replace(/_/g, " "));
 	return {
-		html: data.parse.text as string,
-		title: data.parse.title as string,
+		html: parsed.text,
+		title: parsed.title,
 		categories: cats,
 	};
 }
@@ -458,9 +475,11 @@ async function searchForTitle(
 				formatversion: "2",
 			}).toString();
 		const resp = await requestUrl({ url });
-		const hits = resp.json?.query?.search;
-		if (Array.isArray(hits) && hits.length && hits[0]?.title) {
-			return String(hits[0].title);
+		const json = resp.json as WikiSearchResponse;
+		const hits = json.query?.search;
+		if (hits && hits.length > 0) {
+			const first = hits[0].title;
+			if (first) return first;
 		}
 	} catch {
 		/* fall through */
@@ -891,7 +910,7 @@ function imageEmbed(img: Element): string | null {
 	// Only trust real Wikimedia upload URLs or absolute https images.
 	const okHost = /upload\.wikimedia\.org/.test(src) || /\/\d+px-/.test(src);
 	if (!okHost && !/^https?:\/\//.test(src)) return null;
-	const alt = (img.getAttribute("alt") || "image").replace(/[\[\]]/g, "");
+	const alt = (img.getAttribute("alt") || "image").replace(/[[\]]/g, "");
 	// Respect the image mode: off → nothing, link → a plain markdown link
 	// (no inline display), embed → an inline image embed (default).
 	if (activeImageMode === "off") return null;
@@ -1040,9 +1059,7 @@ function inline(el: Node): string {
 					// If this element wraps a <math> (e.g. span.mwe-math-element),
 					// extract the LaTeX rather than recursing into the raw MathML,
 					// which would flatten to one-symbol-per-line junk.
-					const innerMath = c.querySelector
-						? c.querySelector("math")
-						: null;
+					const innerMath = c.querySelector("math");
 					if (innerMath) {
 						const tex = mathLatex(innerMath);
 						if (tex) {
@@ -1409,7 +1426,7 @@ class TitlePromptModal extends Modal {
 
 	onOpen() {
 		const { contentEl } = this;
-		contentEl.createEl("h3", { text: "Import Wikipedia page" });
+		contentEl.createEl("h2", { text: "Import Wikipedia page" });
 		contentEl.createEl("p", {
 			text: "Enter the exact name of the Wikipedia page to import.",
 			cls: "setting-item-description",
@@ -1419,8 +1436,7 @@ class TitlePromptModal extends Modal {
 			type: "text",
 			placeholder: "e.g. Physics",
 		});
-		input.style.width = "100%";
-		input.style.marginBottom = "0.75em";
+		input.addClass("wikipedia-importer-modal-input");
 		input.addEventListener("input", (e) => {
 			this.value = (e.target as HTMLInputElement).value;
 		});
@@ -1467,14 +1483,13 @@ class NamePromptModal extends Modal {
 
 	onOpen() {
 		const { contentEl } = this;
-		contentEl.createEl("h3", { text: "Name this note" });
+		contentEl.createEl("h2", { text: "Name this note" });
 		contentEl.createEl("p", {
 			text: "This is the name of the imported note (it can differ from the Wikipedia page title).",
 			cls: "setting-item-description",
 		});
 		const input = contentEl.createEl("input", { type: "text" });
-		input.style.width = "100%";
-		input.style.marginBottom = "0.75em";
+		input.addClass("wikipedia-importer-modal-input");
 		input.value = this.value;
 		input.addEventListener("input", (e) => {
 			this.value = (e.target as HTMLInputElement).value;
@@ -1513,7 +1528,7 @@ class TagPromptModal extends Modal {
 
 	onOpen() {
 		const { contentEl } = this;
-		contentEl.createEl("h3", { text: "Add tags" });
+		contentEl.createEl("h2", { text: "Add tags" });
 		contentEl.createEl("p", {
 			text: "Comma-separated. These are added before any automatic tags. Leave blank to skip.",
 			cls: "setting-item-description",
@@ -1522,8 +1537,7 @@ class TagPromptModal extends Modal {
 			type: "text",
 			placeholder: "physics, reference, to-read",
 		});
-		input.style.width = "100%";
-		input.style.marginBottom = "0.75em";
+		input.addClass("wikipedia-importer-modal-input");
 		input.addEventListener("input", (e) => {
 			this.value = (e.target as HTMLInputElement).value;
 		});
@@ -1738,7 +1752,7 @@ class WikiImporterSettingTab extends PluginSettingTab {
 					})
 			);
 
-		containerEl.createEl("h3", { text: "Links & images" });
+		new Setting(containerEl).setName("Links & images").setHeading();
 
 		new Setting(containerEl)
 			.setName("Link style")
@@ -1778,7 +1792,7 @@ class WikiImporterSettingTab extends PluginSettingTab {
 					})
 			);
 
-		containerEl.createEl("h3", { text: "Tags" });
+		new Setting(containerEl).setName("Tags").setHeading();
 
 		new Setting(containerEl)
 			.setName("Tag location")

@@ -6,23 +6,22 @@ This project follows [Semantic Versioning](https://semver.org): `MAJOR.MINOR.PAT
 
 ---
 
-## [1.2.0]
-
-### Added
-- **High-fidelity images.** Wikipedia serves pre-rendered thumbnails; imports now point at the original file instead. SVG diagrams stay as scalable vectors (no longer rasterized to PNG), and animated gifs actually animate. Images still display at their original size, so page layout is unchanged.
-- **Always use original photos** setting. Large photographs load as a high-resolution (1200px) render by default rather than the full original, which can be tens of megabytes with no visible benefit. Enable this to always fetch the original file. Vectors and gifs always use the original regardless.
-
-### Changed
-- Image embeds now carry an explicit display width (`![alt|250](…)`) so the higher-fidelity source renders at the size Wikipedia intended.
-
----
-
-## [1.1.1]
+## [1.1.2]
 
 ### Fixed
-- Resolved Obsidian's automated plugin review findings.
+- **SVG diagrams no longer look blurry.** Wikipedia serves every image — including vector diagrams — as a pre-rendered raster thumbnail. Vectors (`.svg`) and animations (`.gif`) now resolve to their true original file instead, so diagrams stay crisp and gifs actually animate.
+- **Oversized SVG lead images.** The true-original swap above meant a page's lead image, when it was a vector, could render far larger than it appeared on Wikipedia — the lead image never carried a display-width hint the way body images do. It's now sized to match Wikipedia's own width.
+- **Superscript/subscript showed as raw `^`/`~` text** (e.g. `mc^2` instead of mc²) instead of actually rendering — most visible in unit/dimension facts like `J⋅Hz^−1`. These now emit real `<sup>`/`<sub>` HTML, which Obsidian renders properly.
+- **Fixed a duplicate-image bug** where a page's lead image (pulled from the infobox before the infobox is stripped) could appear a second time in the body — the underlying-file comparison didn't recognize a vector's original file and its rasterized thumbnail as the same image.
+- **`versions.json` was invalid JSON** (missing comma), which could confuse Obsidian's compatibility check on install/update.
+- Ordinary photos (jpg/png) are no longer force-upscaled to a fixed resolution — that regressed in an earlier build and could break images whose source file was smaller than the forced size. They're left at the size Wikipedia itself rendered them.
 
----
+### Added
+- **Infoboxes are imported again**, as a collapsed "Quick facts" callout of label/value pairs instead of being stripped entirely. Section dividers (e.g. "Personal details") are kept as bold group labels, and multi-value fields (e.g. a list of languages) are joined onto one line instead of running together.
+
+## [1.1.1]
+- Fixed various errors.
+- Added `styles.css`
 
 ## [1.1.0]
 

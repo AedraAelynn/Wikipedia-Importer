@@ -82,6 +82,7 @@ var WikiImporterPlugin = class extends import_obsidian.Plugin {
   }
   /* -- core flow -------------------------------------------------------- */
   async importByTitle(rawTitle) {
+    var _a;
     const title = rawTitle.trim();
     if (!title) {
       new import_obsidian.Notice("No title given.");
@@ -102,7 +103,9 @@ var WikiImporterPlugin = class extends import_obsidian.Plugin {
       return;
     }
     const rawLeadImage = this.settings.imageMode === "off" ? null : extractLeadImage(html);
-    const leadImage = rawLeadImage ? resolveImageUrl(rawLeadImage) : null;
+    const leadImage = rawLeadImage ? resolveImageUrl(rawLeadImage.src) : null;
+    const leadImageWidth = (_a = rawLeadImage == null ? void 0 : rawLeadImage.width) != null ? _a : 0;
+    const leadImageMd = leadImage ? leadImageWidth > 0 ? `![${resolvedTitle}|${leadImageWidth}](${leadImage})` : `![${resolvedTitle}](${leadImage})` : null;
     const refs = extractReferences(html);
     const body = htmlToObsidianMarkdown(html, {
       leadImage,
@@ -141,8 +144,8 @@ ${refsSection}` : body;
         parts.push(
           this.settings.linkTitleToSource ? `# [${resolvedTitle}](${sourceUrl})` : `# ${resolvedTitle}`
         );
-        if (leadImage)
-          parts.push(`![${resolvedTitle}](${leadImage})`);
+        if (leadImageMd)
+          parts.push(leadImageMd);
         parts.push(
           this.settings.linkTitleToSource ? `*Imported from [Wikipedia](${homeUrl})*` : `*Imported from [Wikipedia](${sourceUrl})*`
         );
@@ -152,8 +155,8 @@ ${refsSection}` : body;
         out = parts.join("\n\n");
       } else {
         const pieces = [];
-        if (leadImage)
-          pieces.push(`![${resolvedTitle}](${leadImage})`);
+        if (leadImageMd)
+          pieces.push(leadImageMd);
         pieces.push(`*Imported from [Wikipedia](${sourceUrl})*`);
         if (inlineTags)
           pieces.push(inlineTags);
@@ -403,10 +406,10 @@ function extractLeadImage(html) {
       if (w && w < 50)
         continue;
       if (/\/\d+px-/.test(src) || /upload\.wikimedia\.org/.test(src)) {
-        return src;
+        return { src, width: w };
       }
       if (/^https?:\/\//.test(src))
-        return src;
+        return { src, width: w };
     }
   }
   return null;
@@ -420,7 +423,8 @@ function stripFluff(root) {
     ".mw-references-wrap",
     ".reflist",
     "ol.references",
-    "table.infobox",
+    // NOTE: table.infobox intentionally NOT stripped — renderBlock() routes
+    // it to renderInfobox() instead of deleting it outright.
     ".navbox",
     // bottom navigation boxes (any element, not just <table>)
     ".navbox-styles",
@@ -584,7 +588,11 @@ function renderBlock(node, out) {
       break;
     }
     case "table": {
-      renderTable(el, out);
+      if (el.classList.contains("infobox")) {
+        renderInfobox(el, out);
+      } else {
+        renderTable(el, out);
+      }
       break;
     }
     case "img": {
@@ -673,6 +681,57 @@ function renderTable(table, out) {
   }
   if (blocks.length)
     out.push(blocks.join("\n\n"));
+}
+function renderInfobox(table, out) {
+  const rows = Array.from(
+    table.querySelectorAll(":scope > tbody > tr, :scope > tr")
+  );
+  const facts = [];
+  for (const row of rows) {
+    const cells = Array.from(
+      row.querySelectorAll(":scope > th, :scope > td")
+    );
+    const img = row.querySelector("img");
+    const rowText = (row.textContent || "").trim();
+    if (img && rowText.length < 40) {
+      const embed = imageEmbed(img);
+      if (embed)
+        facts.push(embed);
+      continue;
+    }
+    const header = row.querySelector("th.infobox-header");
+    if (header) {
+      const label2 = inline(header).trim();
+      if (label2)
+        facts.push(`**${label2}**`);
+      continue;
+    }
+    if (row.querySelector("th.infobox-above"))
+      continue;
+    const label = row.querySelector("th.infobox-label, th");
+    const data = row.querySelector("td.infobox-data, td");
+    if (label && data && cells.length >= 2) {
+      const labelText = inline(label).trim();
+      const valueText = infoboxValue(data);
+      if (labelText && valueText) {
+        facts.push(`**${labelText}:** ${valueText}`);
+      }
+      continue;
+    }
+    if (cells.length === 1) {
+      const text = infoboxValue(cells[0]);
+      if (text)
+        facts.push(text);
+    }
+  }
+  if (!facts.length)
+    return;
+  out.push(
+    ["> [!info]- Quick facts", ...facts.map((f) => `> ${f}`)].join("\n")
+  );
+}
+function infoboxValue(cell) {
+  return inline(cell).split("\n").map((s) => s.trim()).filter(Boolean).join("; ");
 }
 function cellInline(cell) {
   return inline(cell).replace(/\|/g, "\\|").replace(/\n+/g, " ").trim();
@@ -825,14 +884,18 @@ function inline(el) {
               result += `[^${n}]`;
             break;
           }
-          result += `^${inline(c)}`;
+          result += `<sup>${inline(c)}</sup>`;
           break;
         }
         case "sub":
-          result += `~${inline(c)}`;
+          result += `<sub>${inline(c)}</sub>`;
           break;
         case "br":
           result += "\n";
+          break;
+        case "li":
+          result += `
+${inline(c)}`;
           break;
         case "code":
           result += "`" + inline(c) + "`";

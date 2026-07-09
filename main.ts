@@ -40,8 +40,6 @@ interface WikiImporterSettings {
 	referencesStyle: "callout" | "plain"; // how the References section appears
 	linkMode: LinkMode; // how internal links are rendered
 	imageMode: ImageMode; // whether/how images are imported
-	highFidelityImages: boolean; // upgrade thumbnails toward originals
-	forceOriginalImages: boolean; // take originals even for large photos
 	tagLocation: TagLocation; // where tags go
 	fixedTags: string; // comma-separated tags applied to every import
 	autoTagsEnabled: boolean; // whether auto-tags are derived at all
@@ -63,8 +61,6 @@ const DEFAULT_SETTINGS: WikiImporterSettings = {
 	referencesStyle: "callout",
 	linkMode: "wikilinks",
 	imageMode: "embed",
-	highFidelityImages: true,
-	forceOriginalImages: false,
 	tagLocation: "frontmatter",
 	fixedTags: "", // blank by default; placeholder suggests "wikipedia"
 	autoTagsEnabled: true,
@@ -149,14 +145,20 @@ export default class WikiImporterPlugin extends Plugin {
 
 		const rawLeadImage =
 			this.settings.imageMode === "off" ? null : extractLeadImage(html);
-		// Upgrade the lead image toward its original file too.
-		const leadImage =
-			rawLeadImage && this.settings.highFidelityImages
-				? resolveImageUrl(
-						rawLeadImage,
-						this.settings.forceOriginalImages
-				  )
-				: rawLeadImage;
+		// Same vector/animation-to-original upgrade the body images get, so
+		// the lead image isn't left blurrier than the rest of the note.
+		const leadImage = rawLeadImage
+			? resolveImageUrl(rawLeadImage.src)
+			: null;
+		// Wikipedia's own display width, so a vector/original lead image is
+		// sized to match the article instead of showing at its unconstrained
+		// intrinsic size (e.g. a full-page-wide SVG diagram).
+		const leadImageWidth = rawLeadImage?.width ?? 0;
+		const leadImageMd = leadImage
+			? leadImageWidth > 0
+				? `![${resolvedTitle}|${leadImageWidth}](${leadImage})`
+				: `![${resolvedTitle}](${leadImage})`
+			: null;
 		// Extract references FIRST so the footnote map exists before we convert
 		// the body (the in-text [^1] markers need it).
 		const refs = extractReferences(html);
@@ -166,8 +168,6 @@ export default class WikiImporterPlugin extends Plugin {
 			imageMode: this.settings.imageMode,
 			lang: this.settings.wikiLang,
 			footnotes: refs.idToFootnote,
-			highFidelity: this.settings.highFidelityImages,
-			forceOriginal: this.settings.forceOriginalImages,
 		});
 		const refsSection = formatReferences(
 			refs,
@@ -212,7 +212,7 @@ export default class WikiImporterPlugin extends Plugin {
 						? `# [${resolvedTitle}](${sourceUrl})`
 						: `# ${resolvedTitle}`
 				);
-				if (leadImage) parts.push(`![${resolvedTitle}](${leadImage})`);
+				if (leadImageMd) parts.push(leadImageMd);
 				// If the title already links to the page, point the attribution at
 				// Wikipedia's homepage; otherwise carry the page link here.
 				parts.push(
@@ -225,7 +225,7 @@ export default class WikiImporterPlugin extends Plugin {
 				out = parts.join("\n\n");
 			} else {
 				const pieces: string[] = [];
-				if (leadImage) pieces.push(`![${resolvedTitle}](${leadImage})`);
+				if (leadImageMd) pieces.push(leadImageMd);
 				// No title heading, so the attribution line carries the page link.
 				pieces.push(`*Imported from [Wikipedia](${sourceUrl})*`);
 				if (inlineTags) pieces.push(inlineTags);
@@ -516,8 +516,6 @@ let skipImageUrl: string | null = null;
 // caller; default to the original behavior so standalone calls still work).
 let activeLinkMode: LinkMode = "wikilinks";
 let activeImageMode: ImageMode = "embed";
-let activeHighFidelity = true;
-let activeForceOriginal = false;
 let activeLang = "en";
 // Maps a Wikipedia reference <li> id (e.g. "cite_note-foo-3") to its 1-based
 // footnote number, so in-text [1] markers become Obsidian [^1] footnotes.
@@ -529,16 +527,12 @@ interface ConvertOpts {
 	imageMode?: ImageMode;
 	lang?: string;
 	footnotes?: Map<string, number>;
-	highFidelity?: boolean;
-	forceOriginal?: boolean;
 }
 
 function htmlToObsidianMarkdown(html: string, opts: ConvertOpts = {}): string {
 	skipImageUrl = opts.leadImage ?? null;
 	activeLinkMode = opts.linkMode ?? "wikilinks";
 	activeImageMode = opts.imageMode ?? "embed";
-	activeHighFidelity = opts.highFidelity ?? true;
-	activeForceOriginal = opts.forceOriginal ?? false;
 	activeLang = opts.lang ?? "en";
 	footnoteMap = opts.footnotes ?? new Map();
 	const doc = new DOMParser().parseFromString(html, "text/html");
@@ -557,11 +551,19 @@ function htmlToObsidianMarkdown(html: string, opts: ConvertOpts = {}): string {
 	return md + "\n";
 }
 
+interface LeadImage {
+	src: string;
+	/** The width Wikipedia itself displayed this image at, so the note can
+	 * be sized to match instead of showing a vector/original file at its
+	 * unconstrained intrinsic size (see resolveImageUrl). 0 if unknown. */
+	width: number;
+}
+
 /**
  * Find the page's lead image URL BEFORE fluff-stripping removes the infobox.
- * Returns an absolute https URL, or null if none found.
+ * Returns the image plus Wikipedia's own display width, or null if none found.
  */
-function extractLeadImage(html: string): string | null {
+function extractLeadImage(html: string): LeadImage | null {
 	const doc = new DOMParser().parseFromString(html, "text/html");
 	const root = doc.querySelector(".mw-parser-output") ?? doc.body;
 
@@ -598,9 +600,9 @@ function extractLeadImage(html: string): string | null {
 			const w = parseInt(img.getAttribute("width") || "0", 10);
 			if (w && w < 50) continue;
 			if (/\/\d+px-/.test(src) || /upload\.wikimedia\.org/.test(src)) {
-				return src;
+				return { src, width: w };
 			}
-			if (/^https?:\/\//.test(src)) return src;
+			if (/^https?:\/\//.test(src)) return { src, width: w };
 		}
 	}
 	return null;
@@ -615,7 +617,8 @@ function stripFluff(root: Element) {
 		".mw-references-wrap",
 		".reflist",
 		"ol.references",
-		"table.infobox",
+		// NOTE: table.infobox intentionally NOT stripped — renderBlock() routes
+		// it to renderInfobox() instead of deleting it outright.
 		".navbox", // bottom navigation boxes (any element, not just <table>)
 		".navbox-styles",
 		".navbox-inner",
@@ -782,8 +785,14 @@ function renderBlock(node: Node, out: string[]) {
 		}
 		case "table": {
 			// Navboxes are already removed in stripFluff, so tables reaching
-			// here are content. Render them (data → pipe table, layout → lists).
-			renderTable(el, out);
+			// here are content. Infoboxes get their own renderer — their rows
+			// are label/value facts, not a grid, and forcing them into pipes
+			// or the layout-table fallback produces mush (see renderInfobox).
+			if (el.classList.contains("infobox")) {
+				renderInfobox(el, out);
+			} else {
+				renderTable(el, out);
+			}
 			break;
 		}
 		case "img": {
@@ -900,6 +909,85 @@ function renderTable(table: Element, out: string[]) {
 	if (blocks.length) out.push(blocks.join("\n\n"));
 }
 
+/**
+ * Render a Wikipedia infobox as a collapsed callout of label/value facts,
+ * grouped under its own section headers ("Personal details", "Spouse", …).
+ * Infobox rows aren't a grid — a title bar, a photo, section dividers, and
+ * label/data pairs all sit in the same <table> — so this walks the semantic
+ * infobox-* classes MediaWiki already applies rather than trying to stretch
+ * renderTable()'s rectangular-grid logic over them.
+ */
+function renderInfobox(table: Element, out: string[]) {
+	const rows = Array.from(
+		table.querySelectorAll(":scope > tbody > tr, :scope > tr")
+	);
+	const facts: string[] = [];
+
+	for (const row of rows) {
+		const cells = Array.from(
+			row.querySelectorAll(":scope > th, :scope > td")
+		);
+
+		// A row that's essentially just a picture (portrait, flag, map, coat
+		// of arms, …) — render through the normal image pipeline. If it's the
+		// same file already used as the note's lead image, imageEmbed's
+		// dedup silently skips it instead of showing it twice.
+		const img = row.querySelector("img");
+		const rowText = (row.textContent || "").trim();
+		if (img && rowText.length < 40) {
+			const embed = imageEmbed(img);
+			if (embed) facts.push(embed);
+			continue;
+		}
+
+		// Section header: a lone <th> spanning the row, e.g. "Personal details".
+		const header = row.querySelector("th.infobox-header");
+		if (header) {
+			const label = inline(header).trim();
+			if (label) facts.push(`**${label}**`);
+			continue;
+		}
+
+		// The title bar (repeats the note's own title) — skip.
+		if (row.querySelector("th.infobox-above")) continue;
+
+		// The common case: a label cell paired with a data cell.
+		const label = row.querySelector("th.infobox-label, th");
+		const data = row.querySelector("td.infobox-data, td");
+		if (label && data && cells.length >= 2) {
+			const labelText = inline(label).trim();
+			const valueText = infoboxValue(data);
+			if (labelText && valueText) {
+				facts.push(`**${labelText}:** ${valueText}`);
+			}
+			continue;
+		}
+
+		// A lone full-width text cell (subtitle, native-language name, a
+		// classification rank, …) — usually meaningful; keep it as-is.
+		if (cells.length === 1) {
+			const text = infoboxValue(cells[0]);
+			if (text) facts.push(text);
+		}
+	}
+
+	if (!facts.length) return;
+	out.push(
+		["> [!info]- Quick facts", ...facts.map((f) => `> ${f}`)].join("\n")
+	);
+}
+
+/** Inline an infobox value cell, collapsing <br>/<li> line breaks (e.g. a
+ * multi-line address, or a list of languages) into one "; "-joined line so
+ * the fact still fits on a single callout line. */
+function infoboxValue(cell: Element): string {
+	return inline(cell)
+		.split("\n")
+		.map((s) => s.trim())
+		.filter(Boolean)
+		.join("; ");
+}
+
 /** Inline content for a table cell, with pipes escaped so they don't break the row. */
 function cellInline(cell: Element): string {
 	return inline(cell).replace(/\|/g, "\\|").replace(/\n+/g, " ").trim();
@@ -909,59 +997,6 @@ function cellInline(cell: Element): string {
  * Build a Markdown image embed from an <img>, or null if it's a tiny icon,
  * a sprite, or otherwise not a real content image.
  */
-/**
- * Upgrade a Wikimedia thumbnail URL toward the original file.
- *
- * Wikipedia serves <img src> as pre-rendered thumbnails:
- *   .../commons/thumb/3/3b/Pinhole-camera.svg/250px-Pinhole-camera.svg.png
- * Dropping "/thumb/" and the trailing "NNNpx-…" filename yields the original:
- *   .../commons/3/3b/Pinhole-camera.svg
- *
- * Vectors (.svg) and animations (.gif) are always worth taking at original
- * quality — an SVG is usually *smaller* than its PNG rendering and stays sharp
- * at any zoom, and a GIF thumbnail is often a single static frame.
- *
- * Large raster photos are the opposite: a 40 MB original displayed in a 220px
- * box looks identical to a 1000px render but costs 40× the bandwidth. For
- * those we request a generously-sized render instead, unless the user has
- * explicitly asked for originals everywhere.
- */
-function resolveImageUrl(src: string, forceOriginal: boolean): string {
-	const parts = src.split("/");
-	const ti = parts.indexOf("thumb");
-	// Not a thumbnail URL — already the original.
-	if (ti === -1 || parts.length < ti + 5) return src;
-
-	// parts[ti+1], parts[ti+2] are the hash dirs; parts[ti+3] is the real
-	// filename; parts[ti+4] is the "NNNpx-…" rendered name.
-	const originalName = parts[ti + 3];
-	const original =
-		parts.slice(0, ti).join("/") +
-		"/" +
-		parts.slice(ti + 1, ti + 4).join("/");
-
-	const ext = originalName.split(".").pop()?.toLowerCase() ?? "";
-
-	// Vectors and animations: always take the original.
-	if (ext === "svg" || ext === "gif") return original;
-
-	if (forceOriginal) return original;
-
-	// Raster: keep a thumbnail, but request a generous width so the image is
-	// crisp on high-DPI screens without pulling a full-resolution photo.
-	const rendered = parts[ti + 4];
-	const m = rendered.match(/^(\d+)px-(.*)$/);
-	if (!m) return src;
-	const currentWidth = parseInt(m[1], 10);
-	const target = Math.max(currentWidth, HIGH_FIDELITY_RASTER_WIDTH);
-	if (target === currentWidth) return src;
-	parts[ti + 4] = `${target}px-${m[2]}`;
-	return parts.join("/");
-}
-
-/** Width requested for raster renders when upgrading fidelity. */
-const HIGH_FIDELITY_RASTER_WIDTH = 1200;
-
 function imageEmbed(img: Element): string | null {
 	let src = img.getAttribute("src") || "";
 	if (!src) return null;
@@ -987,15 +1022,13 @@ function imageEmbed(img: Element): string | null {
 	// Respect the image mode: off → nothing, link → a plain markdown link
 	// (no inline display), embed → an inline image embed (default).
 	if (activeImageMode === "off") return null;
-
-	// Point at the highest-fidelity source available, then tell Obsidian to
-	// render it at the width Wikipedia used, so the page layout is unchanged.
-	const finalSrc = activeHighFidelity
-		? resolveImageUrl(src, activeForceOriginal)
-		: src;
-
+	// Point vectors/animations at their true original file (see
+	// resolveImageUrl); ordinary photos are left at Wikipedia's own size.
+	const finalSrc = resolveImageUrl(src);
 	if (activeImageMode === "link") return `[${alt}](${finalSrc})`;
-	// `![alt|500](url)` sets the display width in Obsidian.
+	// `![alt|500](url)` tells Obsidian to display the image at the width
+	// Wikipedia itself used, so sizing stays consistent with the article
+	// even when the source URL now points at a full vector/original file.
 	return w > 0 ? `![${alt}|${w}](${finalSrc})` : `![${alt}](${finalSrc})`;
 }
 
@@ -1065,16 +1098,48 @@ function isChromeImage(src: string, img: Element): boolean {
 	return chromePatterns.some((p) => file.includes(p));
 }
 
-/** True if two Wikimedia image URLs point at the same underlying file,
- * ignoring the "/NNNpx-" thumbnail size prefix. */
+/** Extract the underlying Commons filename from a Wikimedia image URL,
+ * whether it's a thumbnail ("/thumb/<h1>/<h2>/Foo.svg/220px-Foo.svg.png")
+ * or a direct original ("/<h1>/<h2>/Foo.svg") — so the same file is
+ * recognized as identical regardless of which shape its URL is in. */
+function canonicalFilename(url: string): string {
+	const parts = url.split("?")[0].split("/");
+	const ti = parts.indexOf("thumb");
+	if (ti !== -1 && parts.length > ti + 3) {
+		return parts[ti + 3].toLowerCase();
+	}
+	return (parts.pop() || url).toLowerCase();
+}
+
+/** True if two Wikimedia image URLs point at the same underlying file. */
 function sameImageFile(a: string, b: string): boolean {
-	const base = (u: string) => {
-		// Take the final path segment and strip a leading "NNNpx-".
-		const seg = u.split("?")[0].split("/").pop() || u;
-		return seg.replace(/^\d+px-/, "").toLowerCase();
-	};
 	if (a === b) return true;
-	return base(a) === base(b);
+	return canonicalFilename(a) === canonicalFilename(b);
+}
+
+/**
+ * Wikipedia serves every image — including vector diagrams — as a raster
+ * thumbnail, e.g.:
+ *   .../commons/thumb/3/3b/Pinhole-camera.svg/250px-Pinhole-camera.svg.png
+ * For vectors (.svg) and animations (.gif) that's a real quality loss: an
+ * SVG rasterized at thumbnail width looks blurry once Obsidian displays it
+ * larger, and a GIF thumbnail is often a single static frame. Dropping
+ * "/thumb/" and the trailing "NNNpx-…" segment yields the real original:
+ *   .../commons/3/3b/Pinhole-camera.svg
+ * Ordinary photos (jpg/png) are left exactly as Wikipedia rendered them —
+ * matching the size Wikipedia itself used keeps note images consistent with
+ * the source article instead of guessing at a "better" resolution.
+ */
+function resolveImageUrl(src: string): string {
+	const parts = src.split("/");
+	const ti = parts.indexOf("thumb");
+	if (ti === -1 || parts.length < ti + 5) return src; // not a thumbnail URL
+	const originalName = parts[ti + 3];
+	const ext = originalName.split(".").pop()?.toLowerCase() ?? "";
+	if (ext !== "svg" && ext !== "gif") return src;
+	return (
+		parts.slice(0, ti).join("/") + "/" + parts.slice(ti + 1, ti + 4).join("/")
+	);
 }
 
 /** Convert inline content (links, bold, italic, text) to markdown. */
@@ -1112,14 +1177,24 @@ function inline(el: Node): string {
 						// Unmapped (e.g. a note, not a citation) → emit nothing.
 						break;
 					}
-					result += `^${inline(c)}`;
+					// Plain markdown has no superscript syntax; raw HTML passes
+					// through markdown renderers (including Obsidian's) intact
+					// and actually renders as superscript, unlike a bare "^".
+					result += `<sup>${inline(c)}</sup>`;
 					break;
 				}
 				case "sub":
-					result += `~${inline(c)}`;
+					result += `<sub>${inline(c)}</sub>`;
 					break;
 				case "br":
 					result += "\n";
+					break;
+				case "li":
+					// <li> shows up inline inside infobox/table cells (e.g. a
+					// list of official languages). Treat it like <br> — a new
+					// line per item — so callers that split on "\n" (like
+					// infoboxValue) see each item as its own entry.
+					result += `\n${inline(c)}`;
 					break;
 				case "code":
 					result += "`" + inline(c) + "`";
@@ -1872,46 +1947,6 @@ class WikiImporterSettingTab extends PluginSettingTab {
 						await this.plugin.saveSettings();
 					})
 			);
-
-		if (this.plugin.settings.imageMode !== "off") {
-			new Setting(containerEl)
-				.setName("High-fidelity images")
-				.setDesc(
-					"Wikipedia serves pre-rendered thumbnails. When on, images " +
-						"point at the original file instead — SVG diagrams stay " +
-						"as scalable vectors, and animated gifs actually animate. " +
-						"Images are still displayed at their original size."
-				)
-				.addToggle((tg) =>
-					tg
-						.setValue(this.plugin.settings.highFidelityImages)
-						.onChange(async (v) => {
-							this.plugin.settings.highFidelityImages = v;
-							await this.plugin.saveSettings();
-							this.display();
-						})
-				);
-
-			if (this.plugin.settings.highFidelityImages) {
-				new Setting(containerEl)
-					.setName("Always use original photos")
-					.setDesc(
-						"By default, large photographs load as a high-resolution " +
-							"render rather than the full original, which can be " +
-							"tens of megabytes with no visible benefit. Turn on to " +
-							"always fetch the original file. (Vectors and gifs " +
-							"already always use the original.)"
-					)
-					.addToggle((tg) =>
-						tg
-							.setValue(this.plugin.settings.forceOriginalImages)
-							.onChange(async (v) => {
-								this.plugin.settings.forceOriginalImages = v;
-								await this.plugin.saveSettings();
-							})
-					);
-			}
-		}
 
 		new Setting(containerEl).setName("Tags").setHeading();
 

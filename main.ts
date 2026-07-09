@@ -40,6 +40,8 @@ interface WikiImporterSettings {
 	referencesStyle: "callout" | "plain"; // how the References section appears
 	linkMode: LinkMode; // how internal links are rendered
 	imageMode: ImageMode; // whether/how images are imported
+	highFidelityImages: boolean; // upgrade thumbnails toward originals
+	forceOriginalImages: boolean; // take originals even for large photos
 	tagLocation: TagLocation; // where tags go
 	fixedTags: string; // comma-separated tags applied to every import
 	autoTagsEnabled: boolean; // whether auto-tags are derived at all
@@ -61,6 +63,8 @@ const DEFAULT_SETTINGS: WikiImporterSettings = {
 	referencesStyle: "callout",
 	linkMode: "wikilinks",
 	imageMode: "embed",
+	highFidelityImages: true,
+	forceOriginalImages: false,
 	tagLocation: "frontmatter",
 	fixedTags: "", // blank by default; placeholder suggests "wikipedia"
 	autoTagsEnabled: true,
@@ -143,8 +147,16 @@ export default class WikiImporterPlugin extends Plugin {
 			return;
 		}
 
-		const leadImage =
+		const rawLeadImage =
 			this.settings.imageMode === "off" ? null : extractLeadImage(html);
+		// Upgrade the lead image toward its original file too.
+		const leadImage =
+			rawLeadImage && this.settings.highFidelityImages
+				? resolveImageUrl(
+						rawLeadImage,
+						this.settings.forceOriginalImages
+				  )
+				: rawLeadImage;
 		// Extract references FIRST so the footnote map exists before we convert
 		// the body (the in-text [^1] markers need it).
 		const refs = extractReferences(html);
@@ -154,6 +166,8 @@ export default class WikiImporterPlugin extends Plugin {
 			imageMode: this.settings.imageMode,
 			lang: this.settings.wikiLang,
 			footnotes: refs.idToFootnote,
+			highFidelity: this.settings.highFidelityImages,
+			forceOriginal: this.settings.forceOriginalImages,
 		});
 		const refsSection = formatReferences(
 			refs,
@@ -502,6 +516,8 @@ let skipImageUrl: string | null = null;
 // caller; default to the original behavior so standalone calls still work).
 let activeLinkMode: LinkMode = "wikilinks";
 let activeImageMode: ImageMode = "embed";
+let activeHighFidelity = true;
+let activeForceOriginal = false;
 let activeLang = "en";
 // Maps a Wikipedia reference <li> id (e.g. "cite_note-foo-3") to its 1-based
 // footnote number, so in-text [1] markers become Obsidian [^1] footnotes.
@@ -513,12 +529,16 @@ interface ConvertOpts {
 	imageMode?: ImageMode;
 	lang?: string;
 	footnotes?: Map<string, number>;
+	highFidelity?: boolean;
+	forceOriginal?: boolean;
 }
 
 function htmlToObsidianMarkdown(html: string, opts: ConvertOpts = {}): string {
 	skipImageUrl = opts.leadImage ?? null;
 	activeLinkMode = opts.linkMode ?? "wikilinks";
 	activeImageMode = opts.imageMode ?? "embed";
+	activeHighFidelity = opts.highFidelity ?? true;
+	activeForceOriginal = opts.forceOriginal ?? false;
 	activeLang = opts.lang ?? "en";
 	footnoteMap = opts.footnotes ?? new Map();
 	const doc = new DOMParser().parseFromString(html, "text/html");
@@ -889,6 +909,59 @@ function cellInline(cell: Element): string {
  * Build a Markdown image embed from an <img>, or null if it's a tiny icon,
  * a sprite, or otherwise not a real content image.
  */
+/**
+ * Upgrade a Wikimedia thumbnail URL toward the original file.
+ *
+ * Wikipedia serves <img src> as pre-rendered thumbnails:
+ *   .../commons/thumb/3/3b/Pinhole-camera.svg/250px-Pinhole-camera.svg.png
+ * Dropping "/thumb/" and the trailing "NNNpx-…" filename yields the original:
+ *   .../commons/3/3b/Pinhole-camera.svg
+ *
+ * Vectors (.svg) and animations (.gif) are always worth taking at original
+ * quality — an SVG is usually *smaller* than its PNG rendering and stays sharp
+ * at any zoom, and a GIF thumbnail is often a single static frame.
+ *
+ * Large raster photos are the opposite: a 40 MB original displayed in a 220px
+ * box looks identical to a 1000px render but costs 40× the bandwidth. For
+ * those we request a generously-sized render instead, unless the user has
+ * explicitly asked for originals everywhere.
+ */
+function resolveImageUrl(src: string, forceOriginal: boolean): string {
+	const parts = src.split("/");
+	const ti = parts.indexOf("thumb");
+	// Not a thumbnail URL — already the original.
+	if (ti === -1 || parts.length < ti + 5) return src;
+
+	// parts[ti+1], parts[ti+2] are the hash dirs; parts[ti+3] is the real
+	// filename; parts[ti+4] is the "NNNpx-…" rendered name.
+	const originalName = parts[ti + 3];
+	const original =
+		parts.slice(0, ti).join("/") +
+		"/" +
+		parts.slice(ti + 1, ti + 4).join("/");
+
+	const ext = originalName.split(".").pop()?.toLowerCase() ?? "";
+
+	// Vectors and animations: always take the original.
+	if (ext === "svg" || ext === "gif") return original;
+
+	if (forceOriginal) return original;
+
+	// Raster: keep a thumbnail, but request a generous width so the image is
+	// crisp on high-DPI screens without pulling a full-resolution photo.
+	const rendered = parts[ti + 4];
+	const m = rendered.match(/^(\d+)px-(.*)$/);
+	if (!m) return src;
+	const currentWidth = parseInt(m[1], 10);
+	const target = Math.max(currentWidth, HIGH_FIDELITY_RASTER_WIDTH);
+	if (target === currentWidth) return src;
+	parts[ti + 4] = `${target}px-${m[2]}`;
+	return parts.join("/");
+}
+
+/** Width requested for raster renders when upgrading fidelity. */
+const HIGH_FIDELITY_RASTER_WIDTH = 1200;
+
 function imageEmbed(img: Element): string | null {
 	let src = img.getAttribute("src") || "";
 	if (!src) return null;
@@ -914,8 +987,16 @@ function imageEmbed(img: Element): string | null {
 	// Respect the image mode: off → nothing, link → a plain markdown link
 	// (no inline display), embed → an inline image embed (default).
 	if (activeImageMode === "off") return null;
-	if (activeImageMode === "link") return `[${alt}](${src})`;
-	return `![${alt}](${src})`;
+
+	// Point at the highest-fidelity source available, then tell Obsidian to
+	// render it at the width Wikipedia used, so the page layout is unchanged.
+	const finalSrc = activeHighFidelity
+		? resolveImageUrl(src, activeForceOriginal)
+		: src;
+
+	if (activeImageMode === "link") return `[${alt}](${finalSrc})`;
+	// `![alt|500](url)` sets the display width in Obsidian.
+	return w > 0 ? `![${alt}|${w}](${finalSrc})` : `![${alt}](${finalSrc})`;
 }
 
 /** Detect interface chrome (icons, logos, lock/edit symbols) vs real content. */
@@ -1791,6 +1872,46 @@ class WikiImporterSettingTab extends PluginSettingTab {
 						await this.plugin.saveSettings();
 					})
 			);
+
+		if (this.plugin.settings.imageMode !== "off") {
+			new Setting(containerEl)
+				.setName("High-fidelity images")
+				.setDesc(
+					"Wikipedia serves pre-rendered thumbnails. When on, images " +
+						"point at the original file instead — SVG diagrams stay " +
+						"as scalable vectors, and animated gifs actually animate. " +
+						"Images are still displayed at their original size."
+				)
+				.addToggle((tg) =>
+					tg
+						.setValue(this.plugin.settings.highFidelityImages)
+						.onChange(async (v) => {
+							this.plugin.settings.highFidelityImages = v;
+							await this.plugin.saveSettings();
+							this.display();
+						})
+				);
+
+			if (this.plugin.settings.highFidelityImages) {
+				new Setting(containerEl)
+					.setName("Always use original photos")
+					.setDesc(
+						"By default, large photographs load as a high-resolution " +
+							"render rather than the full original, which can be " +
+							"tens of megabytes with no visible benefit. Turn on to " +
+							"always fetch the original file. (Vectors and gifs " +
+							"already always use the original.)"
+					)
+					.addToggle((tg) =>
+						tg
+							.setValue(this.plugin.settings.forceOriginalImages)
+							.onChange(async (v) => {
+								this.plugin.settings.forceOriginalImages = v;
+								await this.plugin.saveSettings();
+							})
+					);
+			}
+		}
 
 		new Setting(containerEl).setName("Tags").setHeading();
 

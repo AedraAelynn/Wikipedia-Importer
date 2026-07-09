@@ -6,9 +6,23 @@ This project follows [Semantic Versioning](https://semver.org): `MAJOR.MINOR.PAT
 
 ---
 
+## [1.2.0]
+
+### Added
+- **High-fidelity images.** Wikipedia serves pre-rendered thumbnails; imports now point at the original file instead. SVG diagrams stay as scalable vectors (no longer rasterized to PNG), and animated gifs actually animate. Images still display at their original size, so page layout is unchanged.
+- **Always use original photos** setting. Large photographs load as a high-resolution (1200px) render by default rather than the full original, which can be tens of megabytes with no visible benefit. Enable this to always fetch the original file. Vectors and gifs always use the original regardless.
+
+### Changed
+- Image embeds now carry an explicit display width (`![alt|250](…)`) so the higher-fidelity source renders at the size Wikipedia intended.
+
+---
+
 ## [1.1.1]
-- Fixed various errors.
-- Added `styles.css`
+
+### Fixed
+- Resolved Obsidian's automated plugin review findings.
+
+---
 
 ## [1.1.0]
 

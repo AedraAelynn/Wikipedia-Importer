@@ -6,6 +6,10 @@ This project follows [Semantic Versioning](https://semver.org): `MAJOR.MINOR.PAT
 
 ---
 
+## [1.1.1]
+- Fixed various errors.
+- Added `styles.css`
+
 ## [1.1.0]
 
 ### Added
